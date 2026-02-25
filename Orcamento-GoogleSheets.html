@@ -1,0 +1,2953 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#2563eb" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Benny" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <title>Benedito Resolve — Orçamentos</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Google Identity Services (substituiu o Firebase Auth) -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+  <script>
+    /* ════════════════════════════════════════════════════════
+       CONFIGURAÇÃO — preencha os 2 valores abaixo
+       ════════════════════════════════════════════════════════
+       PASSO 1: Crie um projeto em console.cloud.google.com
+       PASSO 2: Ative a "Google Sheets API"
+       PASSO 3: Crie credenciais → "ID do cliente OAuth 2.0"
+                tipo: "Aplicativo da Web"
+                Origens autorizadas: URL onde você hospeda o HTML
+                (ex: https://seu-usuario.github.io)
+       PASSO 4: Crie uma planilha em sheets.google.com
+                Copie o ID da URL (a parte entre /d/ e /edit)
+       ════════════════════════════════════════════════════════ */
+    const SHEETS_CONFIG = {
+      CLIENT_ID:      'SEU_CLIENT_ID_AQUI.apps.googleusercontent.com',
+      SPREADSHEET_ID: 'ID_DA_SUA_PLANILHA_AQUI',
+      RANGE:          'Dados!A1',   // célula onde o JSON é salvo
+      SCOPE:          'https://www.googleapis.com/auth/spreadsheets',
+    };
+
+    // ── Estado de autenticação ───────────────────────────────
+    let _gsAccessToken  = null;
+    let _gsUserEmail    = '';
+    let _gsTokenClient  = null;
+
+    // Inicializa o client OAuth2 quando o GSI carregar
+    window.addEventListener('load', () => {
+      // pequeno delay para garantir que o script GSI foi parseado
+      setTimeout(_initGSI, 500);
+    });
+
+    function _initGSI() {
+      if (!window.google || !google.accounts) {
+        setTimeout(_initGSI, 300);
+        return;
+      }
+      _gsTokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: SHEETS_CONFIG.CLIENT_ID,
+        scope:     SHEETS_CONFIG.SCOPE,
+        callback:  _onTokenReceived,
+      });
+      // Verifica se há token salvo na sessão
+      const saved = sessionStorage.getItem('_gs_token');
+      if (saved) {
+        try {
+          const obj = JSON.parse(saved);
+          if (obj.expires_at > Date.now()) {
+            _gsAccessToken = obj.token;
+            _gsUserEmail   = obj.email || '';
+            _onLoginSuccess(obj.email);
+            return;
+          }
+        } catch(e) {}
+        sessionStorage.removeItem('_gs_token');
+      }
+    }
+
+    function _onTokenReceived(tokenResp) {
+      if (tokenResp.error) {
+        console.error('Erro OAuth:', tokenResp.error);
+        alert('Erro ao autenticar com Google: ' + tokenResp.error);
+        return;
+      }
+      _gsAccessToken = tokenResp.access_token;
+
+      // Busca email do usuário via userinfo
+      fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: 'Bearer ' + _gsAccessToken }
+      }).then(r => r.json()).then(info => {
+        _gsUserEmail = info.email || '';
+        // Salva token na sessão (expira em 1h)
+        sessionStorage.setItem('_gs_token', JSON.stringify({
+          token: _gsAccessToken,
+          email: _gsUserEmail,
+          expires_at: Date.now() + 3500 * 1000,
+        }));
+        _onLoginSuccess(_gsUserEmail);
+      }).catch(() => _onLoginSuccess(''));
+    }
+
+    function _onLoginSuccess(email) {
+      const panelOut = document.getElementById('firebase-panel-loggedout');
+      const panelIn  = document.getElementById('firebase-panel-loggedin');
+      const emailEl  = document.getElementById('firebase-user-email');
+      if (panelOut) panelOut.style.display = 'none';
+      if (panelIn)  panelIn.style.display  = 'block';
+      if (emailEl)  emailEl.textContent    = '👤 ' + (email || 'Google');
+      console.log('✅ Google Sheets: autenticado como', email);
+      _loadFromCloud();
+    }
+
+    // Login com Google — abre popup OAuth
+    function loginGoogle() {
+      if (!_gsTokenClient) {
+        alert('Aguarde o carregamento do módulo Google...');
+        setTimeout(loginGoogle, 800);
+        return;
+      }
+      _gsTokenClient.requestAccessToken({ prompt: 'consent' });
+    }
+
+    function logout() {
+      if (!confirm('Sair da conta Google? Os dados locais são mantidos.')) return;
+      if (_gsAccessToken && window.google) {
+        google.accounts.oauth2.revoke(_gsAccessToken, () => {});
+      }
+      _gsAccessToken = null;
+      _gsUserEmail   = '';
+      sessionStorage.removeItem('_gs_token');
+      const panelOut = document.getElementById('firebase-panel-loggedout');
+      const panelIn  = document.getElementById('firebase-panel-loggedin');
+      if (panelOut) panelOut.style.display = 'block';
+      if (panelIn)  panelIn.style.display  = 'none';
+      _setSyncStatus('desconectado', '⚪');
+    }
+
+    // ── Salvar no Google Sheets ──────────────────────────────
+    async function _saveToCloud(data) {
+      if (!_gsAccessToken) return;
+      try {
+        _setSyncStatus('salvando…', '🔄');
+        const payload = JSON.stringify({ ...data, _savedAt: new Date().toISOString() });
+        const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEETS_CONFIG.SPREADSHEET_ID}`
+                  + `/values/${encodeURIComponent(SHEETS_CONFIG.RANGE)}`
+                  + `?valueInputOption=RAW`;
+        const resp = await fetch(url, {
+          method:  'PUT',
+          headers: {
+            'Authorization': 'Bearer ' + _gsAccessToken,
+            'Content-Type':  'application/json',
+          },
+          body: JSON.stringify({ values: [[payload]] }),
+        });
+        if (!resp.ok) {
+          // Token expirado? Tenta renovar silenciosamente
+          if (resp.status === 401) { _gsAccessToken = null; sessionStorage.removeItem('_gs_token'); }
+          throw new Error('HTTP ' + resp.status);
+        }
+        _setSyncStatus('sincronizado ☁️ ' + new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}), '✅');
+      } catch(e) {
+        console.error('Erro ao salvar no Sheets:', e);
+        _setSyncStatus('erro ao sincronizar', '⚠️');
+      }
+    }
+
+    // ── Carregar do Google Sheets ────────────────────────────
+    async function _loadFromCloud() {
+      if (!_gsAccessToken) return;
+      try {
+        _setSyncStatus('carregando da nuvem…', '🔄');
+        const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEETS_CONFIG.SPREADSHEET_ID}`
+                  + `/values/${encodeURIComponent(SHEETS_CONFIG.RANGE)}`;
+        const resp = await fetch(url, {
+          headers: { 'Authorization': 'Bearer ' + _gsAccessToken }
+        });
+        if (!resp.ok) {
+          if (resp.status === 401) { _gsAccessToken = null; sessionStorage.removeItem('_gs_token'); }
+          throw new Error('HTTP ' + resp.status);
+        }
+        const json = await resp.json();
+        const raw  = json.values && json.values[0] && json.values[0][0];
+        if (!raw) {
+          _setSyncStatus('nuvem vazia — dados locais em uso', '☁️');
+          return;
+        }
+        const d = JSON.parse(raw);
+        delete d._savedAt;
+        // Mescla com estado atual (nuvem tem prioridade) — lógica idêntica à original
+        if (d.clientName !== undefined) state.clientName = d.clientName;
+        if (d.clientId   !== undefined) state.clientId   = d.clientId;
+        if (Array.isArray(d.services))   state.services   = d.services.map(s=>({notes:'',materialCost:0,embedMaterial:false,duration:0,...s}));
+        if (d.travel)                    Object.assign(state.travel, d.travel);
+        if (Array.isArray(d.quotes))     state.quotes     = d.quotes;
+        if (Array.isArray(d.fixedCosts)) state.fixedCosts = d.fixedCosts;
+        if (Array.isArray(d.clients))    state.clients    = d.clients;
+        if (Array.isArray(d.catalog) && d.catalog.length) state.catalog = d.catalog;
+        if (d.config)                    Object.assign(state.config, d.config);
+        // Re-renderiza com dados da nuvem
+        applyStateToUI();
+        renderDashboard();
+        _setSyncStatus('sincronizado ☁️ ' + new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}), '✅');
+        console.log('✅ Dados carregados do Google Sheets');
+      } catch(e) {
+        console.error('Erro ao carregar do Sheets:', e);
+        _setSyncStatus('erro ao carregar nuvem', '⚠️');
+      }
+    }
+
+    function _setSyncStatus(msg, icon) {
+      const el = document.getElementById('sync-status');
+      if (el) el.innerHTML = `${icon} ${msg}`;
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+    :root {
+      --blue:       #1d4ed8;
+      --blue-light: #3b82f6;
+      --blue-bg:    #eff6ff;
+      --green:      #15803d;
+      --green-bg:   #f0fdf4;
+      --amber:      #b45309;
+      --red:        #991b1b;
+      --slate-50:   #f8fafc;
+      --slate-100:  #f1f5f9;
+      --slate-200:  #e2e8f0;
+      --slate-400:  #94a3b8;
+      --slate-600:  #475569;
+      --slate-700:  #334155;
+      --slate-800:  #1e293b;
+      --radius:     14px;
+      --shadow:     0 2px 12px rgba(0,0,0,.08);
+      --shadow-md:  0 4px 20px rgba(0,0,0,.10);
+    }
+
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: #eef2f7;
+      min-height: 100vh;
+      /* espaço para bottom nav no mobile */
+      padding-bottom: calc(80px + env(safe-area-inset-bottom, 0px));
+    }
+    @media(min-width:768px){ body { padding-bottom: 0; } }
+
+    /* ── TOP NAV TABS (desktop) ──────────────────────────── */
+    .top-tabs-nav {
+      display: none;
+    }
+    @media(min-width:768px){
+      .top-tabs-nav {
+        display: flex;
+        gap: 4px;
+        margin-bottom: 20px;
+        background: rgba(255,255,255,.7);
+        backdrop-filter: blur(8px);
+        padding: 6px;
+        border-radius: var(--radius);
+        border: 1px solid var(--slate-200);
+        box-shadow: var(--shadow);
+      }
+    }
+    .tab-btn {
+      padding: 10px 18px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all .18s;
+      color: var(--slate-600);
+      white-space: nowrap;
+      border: none;
+      background: transparent;
+    }
+    .tab-btn.active {
+      background: var(--blue);
+      color: white;
+      box-shadow: 0 2px 8px rgba(29,78,216,.35);
+    }
+    .tab-btn:hover:not(.active) { background: var(--slate-100); color: var(--slate-800); }
+
+    /* ── BOTTOM NAV (mobile) ─────────────────────────────── */
+    .bottom-nav {
+      display: flex;
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      background: white;
+      border-top: 1px solid var(--slate-200);
+      box-shadow: 0 -4px 20px rgba(0,0,0,.09);
+      z-index: 900;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    @media(min-width:768px){ .bottom-nav { display:none; } }
+
+    .bnav-btn {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      padding: 10px 4px;
+      cursor: pointer;
+      background: none;
+      border: none;
+      color: var(--slate-400);
+      font-size: 10px;
+      font-weight: 600;
+      font-family: 'Inter', sans-serif;
+      transition: color .15s;
+      min-height: 58px;
+    }
+    .bnav-btn svg { width:22px; height:22px; stroke-width:1.8; }
+    .bnav-btn.active { color: var(--blue); }
+    .bnav-btn.active svg { stroke-width: 2.2; }
+
+    /* ── PANELS ─────────────────────────────────────────── */
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ── CARDS ───────────────────────────────────────────── */
+    .card {
+      background: white;
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      border: 1px solid rgba(0,0,0,.04);
+    }
+
+    /* ── INPUTS ──────────────────────────────────────────── */
+    .fi {
+      width: 100%;
+      padding: 11px 13px;
+      border: 1.5px solid var(--slate-200);
+      border-radius: 10px;
+      font-size: 14px;
+      font-family: 'Inter', sans-serif;
+      outline: none;
+      transition: border .15s, box-shadow .15s;
+      background: white;
+      color: var(--slate-800);
+      -webkit-appearance: none;
+    }
+    .fi:focus {
+      border-color: var(--blue-light);
+      box-shadow: 0 0 0 3px rgba(59,130,246,.15);
+    }
+    select.fi { cursor: pointer; }
+    .label-xs {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--slate-400);
+      margin-bottom: 5px;
+      display: block;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+
+    /* ── BADGES ──────────────────────────────────────────── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 99px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+    .badge-enviado     { background: #dbeafe; color: #1d4ed8; }
+    .badge-aprovado    { background: #dcfce7; color: #166534; }
+    .badge-em_execucao { background: #fef3c7; color: #92400e; }
+    .badge-concluido   { background: #d1fae5; color: #065f46; }
+    .badge-perdido     { background: #fee2e2; color: #991b1b; }
+
+    /* ── TOGGLE ──────────────────────────────────────────── */
+    .appt-block { background: var(--green-bg); border: 1px solid #86efac; border-radius: 12px; padding: 14px; }
+    .appt-block.has-date { border-color: #22c55e; background: linear-gradient(135deg,#dcfce7,#f0fdf4); }
+    .tog-track { width:44px; height:26px; background:#cbd5e1; border-radius:99px; position:relative; cursor:pointer; transition:background .2s; flex-shrink:0; }
+    .tog-track.on { background: var(--blue-light); }
+    .tog-thumb { position:absolute; top:3px; left:3px; width:20px; height:20px; background:white; border-radius:50%; transition:left .2s; box-shadow:0 1px 4px rgba(0,0,0,.25); }
+    .tog-track.on .tog-thumb { left:21px; }
+
+    /* ── TRAVEL SECTION ──────────────────────────────────── */
+    .travel-section {
+      background: linear-gradient(135deg, #eff6ff, #f0fdf4);
+      border: 1.5px solid #bfdbfe;
+      border-radius: 12px;
+      padding: 16px;
+    }
+
+    /* ── SERVICE ITEM ────────────────────────────────────── */
+    .svc-item {
+      background: var(--slate-50);
+      border: 1.5px solid var(--slate-200);
+      border-radius: 12px;
+      padding: 14px;
+    }
+
+    /* ── ACCORDION CARDS ─────────────────────────────────── */
+    .quote-card, .client-card {
+      border: 1.5px solid var(--slate-200);
+      border-radius: var(--radius);
+      overflow: hidden;
+      transition: box-shadow .18s;
+    }
+    .quote-card:hover, .client-card:hover { box-shadow: var(--shadow-md); }
+    .quote-card-head, .client-card-head {
+      padding: 16px 18px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      touch-action: manipulation;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .quote-card-head:hover, .client-card-head:hover { background: var(--slate-50); }
+    .quote-card-body, .client-card-body { display: none; padding: 18px; border-top: 1px solid var(--slate-100); }
+    .quote-card.open .quote-card-body, .client-card.open .client-card-body { display: block; }
+    .quote-card.open .chevron, .client-card.open .chevron { transform: rotate(180deg); }
+    .chevron { transition: transform .2s; }
+
+    /* ── PROGRESS BAR ────────────────────────────────────── */
+    .prog-bar  { height: 10px; background: var(--slate-200); border-radius: 99px; overflow: hidden; }
+    .prog-fill { height: 100%; border-radius: 99px; transition: width .4s; background: linear-gradient(90deg,#3b82f6,#1d4ed8); }
+    .prog-fill.warn { background: linear-gradient(90deg,#f59e0b,#d97706); }
+    .prog-fill.ok   { background: linear-gradient(90deg,#22c55e,#16a34a); }
+
+    /* ── MODALS ──────────────────────────────────────────── */
+    .modal { display:none; position:fixed; inset:0; background:rgba(15,23,42,.5); backdrop-filter:blur(4px); z-index:999; align-items:center; justify-content:center; }
+    .modal.open { display:flex; }
+    .modal .inner { background:white; border-radius:20px; padding:28px; width:94%; box-shadow: 0 8px 40px rgba(0,0,0,.18); }
+    #backup-modal .inner { max-width:480px; }
+    /* ── UTILITY ─────────────────────────────────────────── */
+    .d-none { display:none !important; }
+
+    /* ── SHARE VIEW ──────────────────────────────────────── */
+
+    /* ── RANKING BARS ────────────────────────────────────── */
+    .rank-bar-wrap { height:8px; background:var(--slate-200); border-radius:99px; overflow:hidden; flex:1; }
+    .rank-bar-fill { height:100%; border-radius:99px; background:linear-gradient(90deg,#2563eb,#7c3aed); transition:width .5s; }
+    .rank-bar-fill.green { background:linear-gradient(90deg,#22c55e,#16a34a); }
+
+    /* ── CATALOG ITEM ────────────────────────────────────── */
+    .cat-item { display:flex; flex-direction:column; gap:6px; padding:12px 14px; border-radius:10px; border:1.5px solid var(--slate-200); background:var(--slate-50); }
+
+    /* ── STAT CARDS ──────────────────────────────────────── */
+    .stat-card {
+      background: white;
+      border-radius: var(--radius);
+      padding: 18px 16px;
+      text-align: center;
+      box-shadow: var(--shadow);
+      border: 1px solid rgba(0,0,0,.04);
+    }
+    .stat-card .stat-val { font-size: 26px; font-weight: 800; line-height: 1.1; }
+    .stat-card .stat-label { font-size: 11px; color: var(--slate-400); font-weight: 600; margin-top: 4px; text-transform: uppercase; letter-spacing: .04em; }
+
+    /* ── SECTION TITLE ───────────────────────────────────── */
+    .section-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--slate-400);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: 10px;
+    }
+
+    /* ── HEADER ──────────────────────────────────────────── */
+    .app-header {
+      background: white;
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 14px 18px;
+      margin-bottom: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border: 1px solid rgba(0,0,0,.04);
+    }
+
+    #search-results { z-index:50; }
+  </style>
+</head>
+<body class="px-3 pt-3 md:px-6 md:pt-6">
+<!-- ═══ TELA DE SENHA ═══ -->
+<div id="lock-screen" style="display:flex;position:fixed;inset:0;background:#f1f5f9;z-index:99999;align-items:center;justify-content:center;">
+  <div style="background:white;border-radius:20px;padding:36px 28px;width:92%;max-width:360px;box-shadow:0 8px 32px rgba(0,0,0,.12);text-align:center;">
+    <div style="width:64px;height:64px;background:#2563eb;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;">
+      <svg width="28" height="28" fill="none" stroke="white" stroke-width="2.5" viewBox="0 0 24 24">
+        <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/>
+      </svg>
+    </div>
+    <h2 style="font-size:20px;font-weight:700;color:#1e293b;margin-bottom:6px;">Benedito Resolve</h2>
+    <p style="font-size:13px;color:#64748b;margin-bottom:24px;">Digite a senha para continuar</p>
+    <input id="lock-input" type="password" placeholder="senha"
+      style="width:100%;padding:12px 14px;border:2px solid #e2e8f0;border-radius:10px;font-size:15px;outline:none;text-align:center;letter-spacing:4px;font-family:Inter,sans-serif;"
+      onfocus="this.style.borderColor='#3b82f6'"
+      onblur="this.style.borderColor='#e2e8f0'"
+      onkeydown="if(event.key==='Enter')checkPassword()" />
+    <p id="lock-error" style="color:#ef4444;font-size:12px;margin-top:8px;display:none;">Senha incorreta. Tente novamente.</p>
+    <button onclick="checkPassword()"
+      style="margin-top:16px;width:100%;padding:13px;background:#2563eb;color:white;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;font-family:Inter,sans-serif;">
+      Entrar
+    </button>
+  </div>
+</div>
+
+<script>
+(function() {
+  const KEY = atob('bWlkcndraHlnZw==');
+  const HASH = '7e2c4f1a9b3d6e8f0a2c5b7d9e1f3a4c6b8d0e2f4a6c8b0d2e4f6a8c0b2d4e6';
+  window.checkPassword = function() {
+    var val = document.getElementById('lock-input').value;
+    if (val === KEY) {
+      sessionStorage.setItem('br_auth', HASH);
+      document.getElementById('lock-screen').style.display = 'none';
+    } else {
+      var err = document.getElementById('lock-error');
+      err.style.display = 'block';
+      document.getElementById('lock-input').value = '';
+      document.getElementById('lock-input').style.borderColor = '#ef4444';
+      setTimeout(function(){ document.getElementById('lock-input').style.borderColor = '#e2e8f0'; }, 1500);
+    }
+  };
+  document.addEventListener('DOMContentLoaded', function() {
+    var screen = document.getElementById('lock-screen');
+    if (sessionStorage.getItem('br_auth') === HASH) {
+      screen.style.display = 'none';
+    } else {
+      screen.style.display = 'flex';
+      document.getElementById('lock-input').focus();
+    }
+  });
+})();
+</script>
+
+
+<!-- ═══ SHARE READ-ONLY VIEW ═══ -->
+<!-- ═══ SHARE MODAL ═══ -->
+<!-- ═══ EDIT QUOTE MODAL ═══ -->
+<div id="edit-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:flex-start;justify-content:center;overflow-y:auto;padding:20px 12px;">
+  <div style="background:white;border-radius:16px;padding:24px;max-width:580px;width:100%;margin:auto;">
+    <div class="flex justify-between items-center mb-4">
+      <h3 class="text-lg font-bold text-slate-800">✏️ Editar orçamento</h3>
+      <button onclick="closeEditModal()" class="text-slate-400 hover:text-slate-600 text-2xl leading-none">&times;</button>
+    </div>
+
+    <!-- cliente -->
+    <div class="mb-3">
+      <label class="label-xs">cliente</label>
+      <input id="eq-client" type="text" class="fi text-sm" placeholder="nome do cliente" />
+    </div>
+
+    <!-- data do orçamento -->
+    <div class="mb-3">
+      <label class="label-xs">📅 data do orçamento</label>
+      <input id="eq-date" type="date" class="fi text-sm" />
+      <p class="text-xs text-slate-400 mt-1">Altere se precisar lançar com data retroativa.</p>
+    </div>
+
+    <!-- serviços existentes -->
+    <div class="mb-3">
+      <label class="label-xs mb-2 block">serviços</label>
+      <div id="eq-services-list" class="space-y-2 mb-3"></div>
+
+      <!-- adicionar serviço -->
+      <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 space-y-2">
+        <p class="text-xs font-bold text-slate-500">+ adicionar serviço</p>
+        <div class="relative">
+          <input type="text" id="eq-search" placeholder="buscar serviço…" class="fi text-xs" autocomplete="off" />
+          <div id="eq-search-results" class="absolute z-10 w-full mt-1 bg-white border border-slate-200 rounded-xl shadow-xl hidden max-h-48 overflow-y-auto"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- deslocamento -->
+    <div class="mb-3">
+      <label class="label-xs mb-1 block">deslocamento</label>
+      <div class="grid grid-cols-3 gap-2">
+        <div>
+          <label class="label-xs">distância (km)</label>
+          <input id="eq-dist" type="number" min="0" step="0.5" class="fi text-xs" placeholder="0" oninput="recalcEditTotal()" />
+        </div>
+        <div>
+          <label class="label-xs">trajeto</label>
+          <select id="eq-round" class="fi text-xs" onchange="recalcEditTotal()">
+            <option value="1">só ida</option>
+            <option value="2" selected>ida e volta</option>
+          </select>
+        </div>
+        <div>
+          <label class="label-xs">veículo</label>
+          <select id="eq-vehicle" class="fi text-xs" onchange="applyEditVehiclePreset()">
+            <option value="carro_gas">🚗 Carro — Gas.</option>
+            <option value="carro_eta">🚗 Carro — Eta.</option>
+            <option value="moto_gas">🏍️ Moto</option>
+            <option value="pickup">🛻 Pickup</option>
+            <option value="custom">⚙️ Custom</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mt-2">
+        <div><label class="label-xs">consumo (km/L)</label><input id="eq-cons" type="number" min="1" step="0.5" class="fi text-xs" value="10" oninput="recalcEditTotal()" /></div>
+        <div><label class="label-xs">R$/L</label><input id="eq-fuel-price" type="number" min="0" step="0.01" class="fi text-xs" value="6.20" oninput="recalcEditTotal()" /></div>
+        <div><label class="label-xs">manut. R$/km</label><input id="eq-maint-rate" type="number" min="0" step="0.01" class="fi text-xs" value="0.20" oninput="recalcEditTotal()" /></div>
+      </div>
+      <div class="mt-2 flex items-center gap-2">
+        <label class="label-xs">modo</label>
+        <select id="eq-trav-mode" class="fi text-xs w-auto" onchange="recalcEditTotal()">
+          <option value="none">sem deslocamento</option>
+          <option value="visible">mostrar na proposta</option>
+          <option value="diluted">diluir nos serviços</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- totais -->
+    <div class="p-3 bg-blue-50 rounded-xl border border-blue-200 text-sm mb-4">
+      <div class="flex justify-between text-slate-600 mb-1"><span>subtotal serviços:</span><span id="eq-svc-total" class="font-mono font-semibold">R$ 0,00</span></div>
+      <div class="flex justify-between text-slate-600 mb-1 d-none" id="eq-trav-line"><span>deslocamento:</span><span id="eq-trav-val" class="font-mono font-semibold text-blue-600">R$ 0,00</span></div>
+      <div class="flex justify-between font-bold text-slate-800 border-t border-blue-200 pt-1.5 mt-1"><span>total para cliente:</span><span id="eq-grand-total" class="font-mono text-blue-700">R$ 0,00</span></div>
+      <div class="flex justify-between text-slate-500 text-xs mt-1.5 border-t border-blue-100 pt-1.5"><span>⏱️ tempo estimado:</span><span id="eq-time-total" class="font-mono">—</span></div>
+    </div>
+
+    <div class="flex gap-3">
+      <button onclick="closeEditModal()" class="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-semibold transition">cancelar</button>
+      <button onclick="saveEditedQuote()" class="flex-1 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-bold transition">💾 salvar alterações</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ BACKUP MODAL ═══ -->
+<div id="backup-modal" class="modal">
+  <div class="inner">
+    <div class="flex justify-between items-center mb-5">
+      <h3 class="text-xl font-bold text-slate-800">💾 Backup</h3>
+      <button onclick="document.getElementById('backup-modal').classList.remove('open')" class="text-slate-400 hover:text-slate-600 text-2xl leading-none">&times;</button>
+    </div>
+
+    <!-- Painel Firebase -->
+    <div id="firebase-panel-loggedout" style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:16px;margin-bottom:16px;">
+      <p style="font-size:14px;font-weight:600;color:#1e40af;margin-bottom:8px;">📊 Sincronização — Google Sheets</p>
+      <p style="font-size:13px;color:#475569;margin-bottom:12px;">Entre com sua conta Google para sincronizar automaticamente. Os dados ficam na sua planilha — você vê tudo direto no Sheets.</p>
+      <button onclick="loginGoogle()" style="width:100%;padding:10px;background:#1d4ed8;color:white;border:none;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;">
+        🔑 Entrar com Google
+      </button>
+    </div>
+    <div id="firebase-panel-loggedin" style="display:none;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:16px;margin-bottom:16px;">
+      <p style="font-size:14px;font-weight:600;color:#15803d;margin-bottom:4px;">📊 Google Sheets ativo</p>
+      <p id="firebase-user-email" style="font-size:12px;color:#475569;margin-bottom:8px;"></p>
+      <p id="sync-status" style="font-size:12px;color:#475569;margin-bottom:10px;">⚪ aguardando…</p>
+      <button onclick="_loadFromCloud()" style="padding:8px 14px;background:white;border:1px solid #86efac;border-radius:8px;font-size:12px;font-weight:600;color:#15803d;cursor:pointer;margin-right:8px;">
+        🔄 Forçar sincronização
+      </button>
+      <button onclick="logout()" style="padding:8px 14px;background:white;border:1px solid #fca5a5;border-radius:8px;font-size:12px;font-weight:600;color:#991b1b;cursor:pointer;">
+        Sair
+      </button>
+    </div>
+
+    <p class="text-sm text-slate-500 mb-4">Backup manual em JSON (segurança extra):</p>
+    <div class="grid grid-cols-2 gap-3 mb-4">
+      <button onclick="exportJSON()"
+        class="py-3 px-4 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-sm font-bold transition flex items-center justify-center gap-2">
+        ⬇️ Exportar backup
+      </button>
+      <label class="py-3 px-4 bg-white border-2 border-slate-200 hover:border-blue-400 text-slate-700 rounded-xl text-sm font-bold transition flex items-center justify-center gap-2 cursor-pointer">
+        ⬆️ Importar backup
+        <input type="file" accept=".json" class="hidden" onchange="importJSON(this)" />
+      </label>
+    </div>
+    <p id="backup-last" class="text-xs text-slate-400 text-center"></p>
+  </div>
+</div>
+
+<!-- ═══ MAIN ═══ -->
+<div class="max-w-6xl mx-auto">
+
+  <!-- HEADER -->
+  <header class="app-header">
+    <div class="flex items-center gap-3">
+      <div style="width:40px;height:40px;background:linear-gradient(135deg,#1d4ed8,#2563eb);border-radius:12px;display:flex;align-items:center;justify-content:center;box-shadow:0 3px 10px rgba(29,78,216,.35);flex-shrink:0;">
+        <svg width="20" height="20" fill="none" stroke="white" stroke-width="2.2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+        </svg>
+      </div>
+      <div>
+        <h1 id="header-name" class="font-bold text-slate-800" style="font-size:16px;line-height:1.2;letter-spacing:-.01em;">Benedito Resolve</h1>
+        <p id="current-date" class="text-xs text-slate-400" style="margin-top:1px;"></p>
+      </div>
+    </div>
+    <button onclick="document.getElementById('backup-modal').classList.add('open')"
+      style="display:flex;align-items:center;gap:6px;padding:9px 14px;background:#f8fafc;border:1.5px solid #e2e8f0;border-radius:10px;font-size:12px;font-weight:700;color:#475569;cursor:pointer;font-family:Inter,sans-serif;transition:all .15s;"
+      onmouseover="this.style.borderColor='#3b82f6';this.style.color='#1d4ed8';"
+      onmouseout="this.style.borderColor='#e2e8f0';this.style.color='#475569';">
+      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"/></svg>
+      Backup
+    </button>
+  </header>
+
+  <!-- TABS NAV (desktop) -->
+  <nav class="top-tabs-nav">
+    <button class="tab-btn active" onclick="switchTab('orcamento')">Orçamento</button>
+    <button class="tab-btn" onclick="switchTab('clientes')">Clientes</button>
+    <button class="tab-btn" onclick="switchTab('historico')">Histórico</button>
+    <button class="tab-btn" onclick="switchTab('painel')">Painel</button>
+    <button class="tab-btn" onclick="switchTab('config')">Configurações</button>
+  </nav>
+
+  <!-- BOTTOM NAV (mobile) -->
+  <nav class="bottom-nav">
+    <button class="bnav-btn active" id="bnav-orcamento" onclick="switchTab('orcamento')">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+      Orçamento
+    </button>
+    <button class="bnav-btn" id="bnav-clientes" onclick="switchTab('clientes')">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+      Clientes
+    </button>
+    <button class="bnav-btn" id="bnav-historico" onclick="switchTab('historico')">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
+      Histórico
+    </button>
+    <button class="bnav-btn" id="bnav-painel" onclick="switchTab('painel')">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+      Painel
+    </button>
+    <button class="bnav-btn" id="bnav-config" onclick="switchTab('config')">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><circle cx="12" cy="12" r="3"/></svg>
+      Config
+    </button>
+  </nav>
+
+  <!-- ══════════════════════════════════════════
+       TAB 1: ORÇAMENTO
+  ══════════════════════════════════════════════ -->
+  <div class="tab-panel active" id="tab-orcamento">
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+      <!-- coluna esquerda -->
+      <section class="card p-6 space-y-5">
+
+        <!-- cliente -->
+        <div>
+          <h2 class="text-base font-semibold text-slate-700 mb-3">👤 Cliente</h2>
+          <div class="relative">
+            <input id="client-name" type="text" placeholder="nome do cliente ou busque pelo cadastro…" class="fi" autocomplete="off" oninput="onClientNameInput(this.value)" />
+            <div id="client-autocomplete" class="absolute z-30 w-full mt-1 bg-white border border-slate-200 rounded-xl shadow-xl hidden max-h-48 overflow-y-auto"></div>
+          </div>
+          <div id="client-info-box" class="hidden mt-2 p-3 bg-blue-50 rounded-lg text-xs text-blue-800 space-y-0.5"></div>
+        </div>
+
+        <!-- busca -->
+        <div>
+          <h2 class="text-base font-semibold text-slate-700 mb-2">🔍 Buscar serviço</h2>
+          <div class="relative">
+            <input type="text" id="search-input" placeholder="ex: chuveiro, torneira, cortina…" class="fi" />
+            <div id="search-results" class="absolute z-20 w-full mt-1 bg-white border border-slate-200 rounded-xl shadow-xl hidden max-h-64 overflow-y-auto"></div>
+          </div>
+        </div>
+
+        <!-- selecionados -->
+        <div>
+          <h3 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">itens selecionados</h3>
+          <div id="selected-list" class="space-y-2"></div>
+        </div>
+
+        <!-- upsell -->
+        <div class="p-3 rounded-xl border border-slate-200 bg-slate-50">
+          <div class="flex justify-between items-center mb-1">
+            <span class="text-xs font-bold text-slate-600">oportunidades na mesma visita</span>
+            <span class="text-xs text-slate-400">sugestões</span>
+          </div>
+          <ul id="upsell-list" class="text-xs text-slate-600 list-disc pl-4 space-y-1"></ul>
+        </div>
+
+        <!-- deslocamento -->
+        <div class="travel-section space-y-3">
+          <div class="flex items-center justify-between">
+            <span class="text-sm font-bold text-slate-700">🚗 Deslocamento</span>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <div class="tog-track" id="trav-toggle"><div class="tog-thumb"></div></div>
+              <span class="text-xs text-slate-500 font-medium">incluir no total</span>
+            </label>
+          </div>
+          <!-- modo de cobrança -->
+          <div id="trav-mode-row">
+            <label class="label-xs">como cobrar o deslocamento</label>
+            <select id="trav-mode" class="fi text-xs" onchange="updateTravel()">
+              <option value="visible">mostrar separado na proposta</option>
+              <option value="diluted">diluir nos serviços (cliente não vê)</option>
+            </select>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div><label class="label-xs">distância (km)</label>
+              <input id="trav-distance" type="number" min="0" step="0.5" class="fi" placeholder="ex: 12" /></div>
+            <div><label class="label-xs">trajeto</label>
+              <select id="trav-round" class="fi">
+                <option value="1">somente ida</option>
+                <option value="2" selected>ida e volta</option>
+              </select></div>
+          </div>
+          <div><label class="label-xs">veículo</label>
+            <select id="trav-vehicle" class="fi" onchange="applyVehiclePreset()">
+              <option value="carro_gas">🚗 Carro — Gasolina</option>
+              <option value="carro_eta">🚗 Carro — Etanol</option>
+              <option value="moto_gas">🏍️ Moto — Gasolina</option>
+              <option value="pickup">🛻 Pickup/SUV — Gasolina</option>
+              <option value="custom">⚙️ Personalizado</option>
+            </select></div>
+          <div class="grid grid-cols-2 gap-2">
+            <div><label class="label-xs">consumo (km/L)</label>
+              <input id="trav-cons" type="number" min="1" step="0.5" class="fi" value="10" /></div>
+            <div><label class="label-xs">combustível (R$/L)</label>
+              <input id="trav-fuel" type="number" min="0" step="0.01" class="fi" value="6.20" /></div>
+          </div>
+          <div><label class="label-xs">manutenção (R$/km) <span class="text-blue-400 cursor-help" title="Pneus, óleo, freios. Sugerido: R$0,12 moto · R$0,22 carro">ⓘ</span></label>
+            <input id="trav-maint" type="number" min="0" step="0.01" class="fi" value="0.20" /></div>
+          <div class="bg-white rounded-lg p-3 border border-slate-200 text-xs space-y-1">
+            <div class="flex justify-between text-slate-500"><span>distância total:</span><span id="br-dist" class="font-mono font-semibold">—</span></div>
+            <div class="flex justify-between text-slate-500"><span>combustível:</span><span id="br-fuel-val" class="font-mono font-semibold">—</span></div>
+            <div class="flex justify-between text-slate-500"><span>manutenção:</span><span id="br-maint-val" class="font-mono font-semibold">—</span></div>
+            <div class="flex justify-between font-bold text-blue-700 border-t pt-1 mt-1 text-sm"><span>custo total:</span><span id="br-total" class="font-mono">—</span></div>
+            <div id="br-diluted-note" class="hidden text-amber-600 font-semibold border-t pt-1 mt-1">⚡ diluído: +<span id="br-diluted-per">R$ 0,00</span> por serviço</div>
+          </div>
+        </div>
+
+        <!-- totais -->
+        <div class="border-t border-slate-100 pt-4 space-y-1">
+          <div class="flex justify-between text-sm text-slate-500">
+            <span>subtotal serviços:</span><span id="subtotal-val" class="font-semibold">R$ 0,00</span>
+          </div>
+          <div class="flex justify-between text-sm text-slate-500 d-none" id="trav-line-wrap">
+            <span>deslocamento:</span><span id="trav-line-val" class="font-semibold text-blue-600">R$ 0,00</span>
+          </div>
+          <div class="flex justify-between text-xl font-bold text-slate-800">
+            <span>total final:</span><span id="total-val" class="text-blue-600">R$ 0,00</span>
+          </div>
+          <div class="flex justify-between text-xs text-slate-400 pt-0.5" id="time-estimate-line" style="display:none">
+            <span>⏱️ tempo estimado:</span><span id="time-estimate-val" class="font-mono">—</span>
+          </div>
+        </div>
+
+        <button onclick="saveToHistory()"
+          style="width:100%;padding:15px;background:linear-gradient(135deg,#1d4ed8,#2563eb);color:white;font-weight:700;border-radius:12px;border:none;font-size:15px;cursor:pointer;font-family:Inter,sans-serif;box-shadow:0 4px 14px rgba(29,78,216,.35);transition:all .18s;letter-spacing:-.01em;"
+          onmouseover="this.style.transform='translateY(-1px)';this.style.boxShadow='0 6px 18px rgba(29,78,216,.4)'"
+          onmouseout="this.style.transform='';this.style.boxShadow='0 4px 14px rgba(29,78,216,.35)'">
+          Salvar no Histórico
+        </button>
+      </section>
+
+      <!-- coluna direita -->
+      <section class="space-y-4">
+        <div class="card p-6 border-t-4 border-blue-500">
+          <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
+            <h2 class="text-base font-semibold text-slate-700">Proposta profissional</h2>
+            <div class="flex gap-2 flex-wrap">
+              <button id="btn-copy-proposal"
+                class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 px-3 py-2 rounded-lg transition font-medium">copiar texto</button>
+            </div>
+          </div>
+          <pre id="proposal-content" class="text-slate-700 text-sm leading-relaxed bg-slate-50 p-4 rounded-xl min-h-[160px] whitespace-pre-wrap font-mono">olá! segue o detalhamento do orçamento solicitado:
+
+(selecione serviços para gerar a proposta)</pre>
+        </div>
+
+      </section>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       TAB 2: CLIENTES
+  ══════════════════════════════════════════════ -->
+  <div class="tab-panel" id="tab-clientes">
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+      <!-- formulário novo cliente -->
+      <div class="card p-5">
+        <h2 id="client-form-title" class="text-base font-bold text-slate-800 mb-4">➕ Novo Cliente</h2>
+        <div class="space-y-3">
+          <div><label class="label-xs">nome *</label>
+            <input id="cf-name" type="text" placeholder="ex: Márcia Souza" class="fi" /></div>
+          <div><label class="label-xs">telefone / WhatsApp</label>
+            <input id="cf-phone" type="tel" placeholder="(38) 99999-9999" class="fi" /></div>
+          <div><label class="label-xs">endereço / bairro</label>
+            <input id="cf-address" type="text" placeholder="ex: Rua das Flores, 123 — Centro" class="fi" /></div>
+          <div><label class="label-xs">observações</label>
+            <input id="cf-notes" type="text" placeholder="ex: prefere atendimento pela manhã" class="fi" /></div>
+          <input type="hidden" id="cf-editing-id" />
+          <button onclick="saveClient()"
+            class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-bold transition">
+            salvar cliente
+          </button>
+          <button id="cf-cancel-btn" onclick="cancelEditClient()" class="hidden w-full py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg text-sm font-medium transition">
+            cancelar edição
+          </button>
+        </div>
+      </div>
+
+      <!-- lista de clientes -->
+      <div class="lg:col-span-2">
+        <div class="flex justify-between items-center mb-3">
+          <h2 class="text-base font-bold text-slate-800"><span id="clients-count">0</span> Clientes Cadastrados</h2>
+        </div>
+        <div class="relative mb-4">
+          <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 11A6 6 0 115 11a6 6 0 0112 0z"/>
+          </svg>
+          <input id="clients-search" type="text" placeholder="buscar por nome, telefone ou endereço…"
+            class="fi pl-9 text-sm" oninput="renderClients()" />
+        </div>
+        <div id="clients-list" class="space-y-3 pb-4"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       TAB 3: HISTÓRICO
+  ══════════════════════════════════════════════ -->
+  <div class="tab-panel" id="tab-historico">
+    <div class="mb-5 flex flex-wrap gap-3 items-center justify-between">
+      <div>
+        <h2 class="text-lg font-bold text-slate-800">Histórico de Orçamentos</h2>
+        <p id="hist-summary" class="text-xs text-slate-400"></p>
+      </div>
+      <div class="flex gap-2 flex-wrap">
+        <select id="hist-filter" class="fi w-auto text-xs" onchange="renderHistory()">
+          <option value="">todos os status</option>
+          <option value="enviado">enviado</option>
+          <option value="aprovado">aprovado</option>
+          <option value="em_execucao">em execução</option>
+          <option value="concluido">concluído</option>
+          <option value="perdido">perdido</option>
+        </select>
+        <input type="text" id="hist-search" placeholder="buscar cliente…" class="fi w-auto text-xs" oninput="renderHistory()" />
+      </div>
+    </div>
+    <div id="history-list" class="space-y-3 pb-4"></div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       TAB 4: PAINEL
+  ══════════════════════════════════════════════ -->
+  <div class="tab-panel" id="tab-painel">
+    <div class="mb-5">
+      <h2 class="text-lg font-bold text-slate-800">Painel de Gestão</h2>
+      <p class="text-xs text-slate-400" id="stats-month"></p>
+    </div>
+    <div class="space-y-6">
+
+      <!-- estatísticas do mês -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div class="stat-card">
+          <p id="stat-total-quotes" class="stat-val text-blue-700">0</p>
+          <p class="stat-label">orçamentos</p>
+        </div>
+        <div class="stat-card">
+          <p id="stat-conversion" class="stat-val text-green-700">0%</p>
+          <p class="stat-label">conversão</p>
+        </div>
+        <div class="stat-card">
+          <p id="stat-revenue" class="stat-val text-purple-700" style="font-size:20px;">R$0</p>
+          <p class="stat-label">faturamento (mês)</p>
+        </div>
+        <div class="stat-card">
+          <p id="stat-avg-ticket" class="stat-val text-amber-700" style="font-size:20px;">R$0</p>
+          <p class="stat-label">ticket médio</p>
+        </div>
+      </div>
+      <!-- horas + valor/hora -->
+      <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+        <div class="stat-card">
+          <p id="stat-hours" class="stat-val text-cyan-700">0h</p>
+          <p class="stat-label">horas (mês)</p>
+        </div>
+        <div class="stat-card">
+          <p id="stat-hourly" class="stat-val text-teal-700" style="font-size:20px;">—</p>
+          <p class="stat-label">valor/hora</p>
+        </div>
+        <div class="stat-card col-span-2 md:col-span-1">
+          <p id="stat-hours-total" class="stat-val text-slate-600">0h</p>
+          <p class="stat-label">horas totais</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+        <!-- ponto de equilíbrio -->
+        <div class="card p-6">
+          <h2 class="text-base font-bold text-slate-800 mb-1">Ponto de Equilíbrio</h2>
+          <div class="space-y-2 mb-3" id="fixed-costs-list"></div>
+          <div class="flex gap-2 mb-4">
+            <input id="new-cost-name" type="text" placeholder="nome (ex: celular)" class="fi flex-1 text-sm" />
+            <input id="new-cost-value" type="number" placeholder="R$" class="fi w-24 text-sm" />
+            <button onclick="addFixedCost()" class="px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 transition">+</button>
+          </div>
+          <div class="p-4 bg-slate-50 rounded-xl border border-slate-200">
+            <div class="flex justify-between text-sm mb-1">
+              <span class="text-slate-600">custos fixos:</span>
+              <span id="pe-fixed-total" class="font-bold text-slate-800">R$ 0,00</span>
+            </div>
+            <div class="flex justify-between text-sm mb-3">
+              <span class="text-slate-600">faturado (concluídos):</span>
+              <span id="pe-revenue" class="font-bold text-green-600">R$ 0,00</span>
+            </div>
+            <div class="prog-bar mb-2"><div class="prog-fill" id="pe-bar" style="width:0%"></div></div>
+            <p id="pe-status" class="text-xs text-center font-semibold text-slate-500"></p>
+          </div>
+          <div class="mt-4 p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+            <p class="font-bold text-slate-600 mb-2 uppercase tracking-wide text-xs">Fluxo de caixa (concluídos — histórico completo)</p>
+
+            <div class="flex justify-between mb-1 text-slate-700 font-semibold"><span>📥 faturamento bruto</span><span id="mrg-revenue" class="font-mono">R$ 0,00</span></div>
+
+            <div class="border-t border-slate-200 my-2"></div>
+            <p class="text-xs text-slate-400 font-bold mb-1.5 uppercase tracking-wide">(−) custos variáveis</p>
+            <div class="flex justify-between mb-1 text-slate-500"><span>🧱 material</span><span id="mrg-cost" class="font-mono text-red-400">R$ 0,00</span></div>
+            <div class="flex justify-between mb-1 text-slate-500"><span>⛽ combustível</span><span id="mrg-fuel" class="font-mono text-red-400">R$ 0,00</span></div>
+            <div class="flex justify-between mb-1 text-slate-500"><span>🔧 manutenção veículo</span><span id="mrg-maint" class="font-mono text-red-400">R$ 0,00</span></div>
+            <div class="flex justify-between text-slate-600 font-semibold border-t border-slate-200 pt-1.5 mt-1 mb-1"><span>total variável</span><span id="mrg-total-costs" class="font-mono text-red-500">R$ 0,00</span></div>
+
+            <div class="border-t border-slate-200 my-2"></div>
+            <div class="flex justify-between text-slate-700 font-semibold mb-1"><span>= lucro bruto</span><span id="mrg-gross-val" class="font-mono text-blue-600">R$ 0,00</span></div>
+
+            <div class="border-t border-dashed border-slate-300 my-2"></div>
+            <p class="text-xs text-slate-400 font-bold mb-1.5 uppercase tracking-wide">(−) custos fixos do mês</p>
+            <div class="flex justify-between mb-1 text-slate-500"><span>total fixo</span><span id="mrg-fixed" class="font-mono text-red-400">R$ 0,00</span></div>
+
+            <div class="border-t border-slate-200 my-2"></div>
+            <div class="flex justify-between font-bold text-sm text-slate-800"><span>💰 lucro líquido</span><span id="mrg-gross" class="font-mono">R$ 0,00 (0%)</span></div>
+            <div class="flex justify-between text-slate-500 mt-1"><span>⏱️ valor/hora líquido</span><span id="mrg-hourly" class="font-mono text-teal-600 font-semibold">—</span></div>
+          </div>
+        </div>
+
+        <!-- clientes que mais geram receita -->
+        <div class="card p-6">
+          <h2 class="text-base font-bold text-slate-800 mb-1">Clientes por Receita</h2>
+          <p class="text-xs text-slate-400 mb-4">histórico completo — orçamentos concluídos</p>
+          <div id="top-clients-list" class="space-y-3"></div>
+        </div>
+      </div>
+
+      <!-- serviços mais lucrativos -->
+      <div class="card p-6">
+        <h2 class="text-base font-bold text-slate-800 mb-1">Serviços Mais Lucrativos</h2>
+        <p class="text-xs text-slate-400 mb-4">baseado em orçamentos concluídos — ordenado por lucro absoluto</p>
+        <div id="top-services-list" class="space-y-3"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       TAB 5: CONFIGURAÇÕES
+  ══════════════════════════════════════════════ -->
+  <div class="tab-panel" id="tab-config">
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+      <!-- dados pessoais -->
+      <div class="card p-6">
+        <h2 class="text-base font-bold text-slate-800 mb-4">👤 Seus dados (aparecem na proposta e no PDF)</h2>
+        <div class="space-y-3">
+          <div><label class="label-xs">seu nome / nome do negócio</label>
+            <input id="cfg-owner" type="text" placeholder="ex: Benedito Resolve" class="fi" /></div>
+          <div><label class="label-xs">slogan / descrição</label>
+            <input id="cfg-slogan" type="text" placeholder="ex: Serviços elétricos, hidráulicos e reformas" class="fi" /></div>
+          <div><label class="label-xs">telefone / WhatsApp</label>
+            <input id="cfg-phone" type="tel" placeholder="ex: (38) 99999-9999" class="fi" /></div>
+          <div><label class="label-xs">cidade</label>
+            <input id="cfg-city" type="text" placeholder="ex: Montes Claros - MG" class="fi" /></div>
+          <div class="grid grid-cols-2 gap-2">
+            <div><label class="label-xs">tipo da chave Pix</label>
+              <select id="cfg-pix-type" class="fi">
+                <option value="CPF">CPF</option>
+                <option value="CNPJ">CNPJ</option>
+                <option value="E-mail">E-mail</option>
+                <option value="Telefone">Telefone</option>
+                <option value="Chave aleatória">Chave aleatória</option>
+              </select></div>
+            <div><label class="label-xs">chave Pix</label>
+              <input id="cfg-pix-key" type="text" placeholder="ex: 000.000.000-00" class="fi" /></div>
+          </div>
+          <div><label class="label-xs">prazo de garantia</label>
+            <input id="cfg-guarantee" type="text" placeholder="ex: 6 meses" class="fi" /></div>
+          <button onclick="saveConfig()"
+            class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-bold transition mt-2">
+            salvar dados
+          </button>
+          <p id="cfg-saved-msg" class="text-xs text-green-600 text-center hidden">✅ dados salvos!</p>
+        </div>
+      </div>
+
+      <!-- catálogo de serviços -->
+      <div class="card p-6">
+        <h2 class="text-base font-bold text-slate-800 mb-1">🛠️ Catálogo de Serviços</h2>
+        <p class="text-xs text-slate-400 mb-4">ajuste os preços mínimos e máximos, adicione ou remova serviços</p>
+
+        <!-- adicionar serviço -->
+        <div class="bg-slate-50 rounded-xl p-3 mb-4 space-y-2">
+          <p class="text-xs font-bold text-slate-600">adicionar serviço</p>
+          <div class="grid grid-cols-2 gap-2">
+            <div><label class="label-xs">nome</label>
+              <input id="nc-name" type="text" placeholder="ex: Troca de registro" class="fi" /></div>
+            <div><label class="label-xs">categoria</label>
+              <input id="nc-category" type="text" placeholder="ex: HIDRÁULICA" class="fi" /></div>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div><label class="label-xs">mínimo (R$)</label>
+              <input id="nc-min" type="number" min="0" step="1" class="fi" /></div>
+            <div><label class="label-xs">máximo (R$)</label>
+              <input id="nc-max" type="number" min="0" step="1" class="fi" /></div>
+          </div>
+          <div><label class="label-xs">duração padrão (min) <span class="text-slate-400 font-normal">— opcional</span></label>
+            <input id="nc-duration" type="number" min="0" step="5" placeholder="ex: 45" class="fi" /></div>
+          <button onclick="addCatalogItem()" class="w-full py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-xs font-bold transition">➕ adicionar ao catálogo</button>
+        </div>
+
+        <!-- filtro + lista -->
+        <input type="text" id="catalog-search" placeholder="buscar no catálogo…" class="fi mb-3 text-xs" oninput="renderCatalog()" />
+        <div class="flex justify-between items-center mb-2">
+          <span id="catalog-count" class="text-xs text-slate-400"></span>
+          <button onclick="resetCatalog()" class="text-xs text-red-400 hover:text-red-600 underline">restaurar padrões</button>
+        </div>
+        <div id="catalog-list" class="space-y-2 max-h-96 overflow-y-auto pr-1"></div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /max-w -->
+
+<script>
+/* ============================================================
+   UTILITÁRIOS
+   ============================================================ */
+const fBRL  = v => new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(Number(v)||0);
+// Arredonda para o múltiplo de 5 imediatamente acima (ex: 47 → 50, 50 → 50, 53 → 55)
+const roundUp5 = v => { const n = Number(v)||0; const r = n % 5; return r === 0 ? n : n + (5 - r); };
+const fBRL5  = v => fBRL(roundUp5(v));  // versão arredondada para uso na proposta/cliente
+const fPct  = v => `${Math.round(v)}%`;
+const safeStr = t => (t??'').toString().trim();
+const makeId  = () => crypto?.randomUUID ? crypto.randomUUID() : Date.now()+'-'+Math.random().toString(36).slice(2);
+const escHtml = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+
+async function copyText(text) {
+  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; } } catch(_){}
+  try {
+    const el = document.createElement('textarea'); el.value = text;
+    el.style.cssText='position:fixed;left:-9999px'; document.body.appendChild(el);
+    el.focus(); el.select(); const ok=document.execCommand('copy'); document.body.removeChild(el); return ok;
+  } catch(_){ return false; }
+}
+
+/* ============================================================
+   CATÁLOGO PADRÃO
+   ============================================================ */
+const DEFAULT_CATALOG = [
+  {category:"ELÉTRICA",name:"instalação de ventilador de teto",min:80,max:180},
+  {category:"ELÉTRICA",name:"instalação de lustre/pendente",min:60,max:150},
+  {category:"ELÉTRICA",name:"instalação de chuveiro elétrico (ponto existente)",min:50,max:120},
+  {category:"ELÉTRICA",name:"troca de disjuntor",min:40,max:100},
+  {category:"ELÉTRICA",name:"tomada extra (ponto novo com eletroduto)",min:120,max:300},
+  {category:"ELÉTRICA",name:"tomada extra (sem quebra/eletroduto aparente)",min:60,max:150},
+  {category:"ELÉTRICA",name:"interruptor simples",min:50,max:120},
+  {category:"ELÉTRICA",name:"interruptor paralelo (three-way)",min:80,max:180},
+  {category:"ELÉTRICA",name:"luminária/soquete",min:40,max:100},
+  {category:"ELÉTRICA",name:"instalação de campainha",min:60,max:150},
+  {category:"HIDRÁULICA",name:"troca de torneira (pia/tanque)",min:50,max:120},
+  {category:"HIDRÁULICA",name:"troca de torneira de jardim/externa",min:40,max:100},
+  {category:"HIDRÁULICA",name:"reparo/troca de válvula de descarga",min:60,max:150},
+  {category:"HIDRÁULICA",name:"troca de registro",min:60,max:150},
+  {category:"HIDRÁULICA",name:"troca de sifão",min:40,max:100},
+  {category:"HIDRÁULICA",name:"desentupimento (ralo/pia/vaso)",min:80,max:200},
+  {category:"HIDRÁULICA",name:"vedação de vazamento (flexível/engate)",min:50,max:120},
+  {category:"HIDRÁULICA",name:"troca de ralo",min:40,max:100},
+  {category:"HIDRÁULICA",name:"instalação de filtro (ponto existente)",min:50,max:120},
+  {category:"INSTALAÇÃO",name:"instalação de suporte de TV até 55\"",min:80,max:180},
+  {category:"INSTALAÇÃO",name:"instalação de suporte de TV acima de 55\"",min:120,max:250},
+  {category:"INSTALAÇÃO",name:"prateleira/nicho (até 60cm)",min:60,max:150},
+  {category:"INSTALAÇÃO",name:"prateleira/nicho (acima de 60cm)",min:80,max:180},
+  {category:"INSTALAÇÃO",name:"instalação de espelho",min:50,max:120},
+  {category:"INSTALAÇÃO",name:"instalação de quadro/moldura",min:40,max:100},
+  {category:"INSTALAÇÃO",name:"cabideiro/gancho",min:30,max:80},
+  {category:"INSTALAÇÃO",name:"varão/trilho de cortina (até 2m)",min:80,max:180},
+  {category:"INSTALAÇÃO",name:"varão/trilho de cortina (acima de 2m)",min:120,max:250},
+  {category:"INSTALAÇÃO",name:"instalação de persiana",min:80,max:180},
+  {category:"MÓVEIS",name:"montagem de móvel pequeno (mesa/rack)",min:80,max:180},
+  {category:"MÓVEIS",name:"montagem de móvel médio (guarda-roupa 2 portas)",min:150,max:350},
+  {category:"MÓVEIS",name:"montagem de móvel grande (cozinha/closet)",min:300,max:800},
+  {category:"MÓVEIS",name:"ajuste de porta/dobradiça",min:50,max:120},
+  {category:"MÓVEIS",name:"troca de puxador",min:30,max:80},
+  {category:"REPAROS",name:"vedação/calafetagem (box/pia)",min:60,max:150},
+  {category:"REPAROS",name:"troca de rodapé (por metro)",min:20,max:50},
+  {category:"REPAROS",name:"rebaixamento de porta",min:60,max:150},
+  {category:"REPAROS",name:"ajuste de fechadura",min:50,max:120},
+  {category:"OUTROS",name:"avaliação técnica/visita",min:50,max:150},
+];
+
+/* ============================================================
+   ESTADO
+   ============================================================ */
+const state = {
+  clientName: '',
+  clientId:   null,
+  services:   [],
+  travel: { enabled:false, distance:0, roundTrip:2, vehicle:'carro_gas', consumption:10, fuelPrice:6.20, maintenance:0.20, mode:'visible' },
+  quotes:     [],
+  fixedCosts: [],
+  clients:    [],
+  catalog:    [],
+  config: {
+    ownerName:  'Benedito Resolve',
+    slogan:     'Serviços elétricos, hidráulicos e reformas',
+    phone:      '',
+    city:       '',
+    pixKey:     '',
+    pixType:    'CPF',
+    guarantee:  '6 meses',
+  },
+  activeTab: 'orcamento',
+};
+
+/* ============================================================
+   PERSISTÊNCIA
+   ============================================================ */
+const SK = 'benedito_v8';
+
+function saveAll() {
+  try {
+    const payload = {
+      clientName: state.clientName,
+      clientId:   state.clientId,
+      services:   state.services,
+      travel:     state.travel,
+      quotes:     state.quotes,
+      fixedCosts: state.fixedCosts,
+      clients:    state.clients,
+      catalog:    state.catalog,
+      config:     state.config,
+    };
+    localStorage.setItem(SK, JSON.stringify(payload));
+    updateBackupDate();
+    // Salva na nuvem com debounce (evita chamadas excessivas)
+    if (typeof _saveToCloud === 'function') {
+      clearTimeout(window._cloudSaveTimer);
+      window._cloudSaveTimer = setTimeout(() => _saveToCloud(payload), 2000);
+    }
+  } catch(e) {
+    console.error('Erro ao salvar:', e);
+    alert('⚠️ Erro ao salvar: armazenamento cheio. Exporte um backup JSON e limpe orçamentos antigos.');
+  }
+}
+
+function loadAll() {
+  try {
+    const raw = localStorage.getItem(SK);
+    if (!raw) { state.catalog = JSON.parse(JSON.stringify(DEFAULT_CATALOG)); return; }
+    const p = JSON.parse(raw);
+    if (!p) { state.catalog = JSON.parse(JSON.stringify(DEFAULT_CATALOG)); return; }
+    if (p.clientName !== undefined) state.clientName = p.clientName;
+    if (p.clientId   !== undefined) state.clientId   = p.clientId;
+    if (Array.isArray(p.services))   state.services   = p.services.map(s=>({notes:'',materialCost:0,embedMaterial:false,duration:0,...s}));
+    if (p.travel)                    Object.assign(state.travel, p.travel);
+    if (Array.isArray(p.quotes))     state.quotes     = p.quotes;
+    if (Array.isArray(p.fixedCosts)) state.fixedCosts = p.fixedCosts;
+    if (Array.isArray(p.clients))    state.clients    = p.clients;
+    if (Array.isArray(p.catalog) && p.catalog.length) state.catalog = p.catalog;
+    else state.catalog = JSON.parse(JSON.stringify(DEFAULT_CATALOG));
+    if (p.config)                    Object.assign(state.config, p.config);
+  } catch(err) { 
+    console.error('Erro ao carregar:', err);
+    state.catalog = JSON.parse(JSON.stringify(DEFAULT_CATALOG)); 
+  }
+}
+
+function updateBackupDate() {
+  const el = document.getElementById('backup-last');
+  if (el) el.innerText = `último auto-save: ${new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}`;
+}
+
+/* ============================================================
+   JSON BACKUP
+   ============================================================ */
+function exportJSON() {
+  const payload = { exportedAt: new Date().toISOString(), version: 7,
+    data: { clientName:state.clientName, clientId:state.clientId,
+      services:state.services, travel:state.travel, quotes:state.quotes,
+      fixedCosts:state.fixedCosts, clients:state.clients,
+      catalog:state.catalog, config:state.config }};
+  const blob = new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url;
+  a.download = `benedito-backup-${new Date().toLocaleDateString('pt-BR').replace(/\//g,'-')}.json`;
+  a.click(); URL.revokeObjectURL(url);
+}
+
+function importJSON(input) {
+  const file = input.files[0]; if (!file) return;
+  if (!confirm('⚠️ Importar vai substituir TODOS os dados atuais. Deseja continuar?')) { input.value=''; return; }
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const parsed = JSON.parse(e.target.result);
+      const d = parsed.data || parsed;
+      if (d.quotes)     state.quotes     = d.quotes;
+      if (d.fixedCosts) state.fixedCosts = d.fixedCosts;
+      if (d.clients)    state.clients    = d.clients;
+      if (d.catalog && d.catalog.length) state.catalog = d.catalog;
+      if (d.config)     Object.assign(state.config, d.config);
+      if (d.clientName !== undefined) state.clientName = d.clientName;
+      if (d.services)   state.services   = d.services;
+      if (d.travel)     Object.assign(state.travel, d.travel);
+      saveAll(); applyStateToUI();
+      alert(`✅ Backup importado! ${state.quotes.length} orçamento(s) restaurado(s).`);
+    } catch(err) { alert('❌ Arquivo inválido: ' + err.message); }
+    input.value='';
+  };
+  reader.readAsText(file);
+}
+
+function applyStateToUI() {
+  applyConfigToUI();
+  applyTravelToUI();
+  populateClientSelect();
+  const clientInput = document.getElementById('client-name');
+  if (clientInput) clientInput.value = state.clientName;
+  if (state.clientId) {
+    const c = state.clients.find(c=>c.id===state.clientId);
+    if (c) showClientInfoBox(c);
+  }
+  renderServicesList();
+  renderClients();
+  renderHistory();
+  renderDashboard();
+  renderCatalog();
+}
+
+/* ============================================================
+   TABS
+   ============================================================ */
+function switchTab(tab) {
+  state.activeTab = tab;
+  const tabs = ['orcamento','clientes','historico','painel','config'];
+  document.querySelectorAll('.tab-btn').forEach((b,i) => b.classList.toggle('active', tabs[i]===tab));
+  // bottom nav
+  tabs.forEach(t => { const el = document.getElementById('bnav-'+t); if(el) el.classList.toggle('active', t===tab); });
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('tab-'+tab).classList.add('active');
+  if (tab==='historico') renderHistory();
+  if (tab==='painel')    renderDashboard();
+  if (tab==='clientes')  renderClients();
+  if (tab==='config')    { applyConfigToUI(); renderCatalog(); }
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+/* ============================================================
+   CONFIGURAÇÕES
+   ============================================================ */
+function applyConfigToUI() {
+  document.getElementById('cfg-owner').value     = state.config.ownerName;
+  document.getElementById('cfg-slogan').value    = state.config.slogan;
+  document.getElementById('cfg-phone').value     = state.config.phone;
+  document.getElementById('cfg-city').value      = state.config.city;
+  document.getElementById('cfg-pix-type').value  = state.config.pixType;
+  document.getElementById('cfg-pix-key').value   = state.config.pixKey;
+  document.getElementById('cfg-guarantee').value = state.config.guarantee;
+  // atualiza header
+  document.getElementById('header-name').innerText = state.config.ownerName || 'Benedito Resolve';
+  // share view
+  const sn = document.getElementById('share-owner-name');
+  const ss = document.getElementById('share-owner-sub');
+  if (sn) sn.innerText = state.config.ownerName;
+  if (ss) ss.innerText = state.config.slogan;
+}
+
+function saveConfig() {
+  state.config.ownerName  = safeStr(document.getElementById('cfg-owner').value) || 'Benedito Resolve';
+  state.config.slogan     = safeStr(document.getElementById('cfg-slogan').value);
+  state.config.phone      = safeStr(document.getElementById('cfg-phone').value);
+  state.config.city       = safeStr(document.getElementById('cfg-city').value);
+  state.config.pixType    = document.getElementById('cfg-pix-type').value;
+  state.config.pixKey     = safeStr(document.getElementById('cfg-pix-key').value);
+  state.config.guarantee  = safeStr(document.getElementById('cfg-guarantee').value) || '6 meses';
+  saveAll(); applyConfigToUI(); updateTexts();
+  const msg = document.getElementById('cfg-saved-msg');
+  msg.classList.remove('hidden'); setTimeout(()=>msg.classList.add('hidden'),2500);
+}
+
+/* ============================================================
+   CATÁLOGO
+   ============================================================ */
+function renderCatalog() {
+  const term = (document.getElementById('catalog-search').value||'').toLowerCase();
+  const items = state.catalog.filter(s => !term || s.name.toLowerCase().includes(term) || s.category.toLowerCase().includes(term));
+  document.getElementById('catalog-count').innerText = `${items.length} de ${state.catalog.length} serviços`;
+
+  const list = document.getElementById('catalog-list');
+  if (!items.length) { list.innerHTML=`<p class="text-xs text-slate-400 italic text-center py-4">nenhum resultado.</p>`; return; }
+
+  // group by category
+  const groups = {};
+  items.forEach(s => { if (!groups[s.category]) groups[s.category]=[]; groups[s.category].push(s); });
+
+  list.innerHTML = Object.entries(groups).map(([cat, svcs]) => `
+    <div class="mb-3">
+      <p class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1.5">${cat}</p>
+      <div class="space-y-1.5">
+        ${svcs.map(s => {
+          const idx = state.catalog.findIndex(c => c.name===s.name && c.category===s.category);
+          return `<div class="cat-item">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:4px;">
+              <span style="font-size:12px;font-weight:600;color:#1e293b;flex:1;">${escHtml(s.name)}</span>
+              <button onclick="removeCatalogItem(${idx})" class="text-red-400 hover:text-red-600 flex-shrink-0" title="remover">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+              <span class="text-xs text-slate-400">mín</span>
+              <input type="number" value="${s.min}" min="0" step="1"
+                class="fi text-xs font-mono" style="width:72px"
+                onchange="updateCatalogItem(${idx},'min',this.value)" />
+              <span class="text-xs text-slate-400">máx</span>
+              <input type="number" value="${s.max}" min="0" step="1"
+                class="fi text-xs font-mono" style="width:72px"
+                onchange="updateCatalogItem(${idx},'max',this.value)" />
+              <input type="number" value="${s.duration||''}" min="0" step="5" placeholder="min"
+                class="fi text-xs font-mono" style="width:58px" title="duração padrão (minutos)"
+                onchange="updateCatalogItem(${idx},'duration',this.value)" />
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`).join('');
+}
+
+function updateCatalogItem(idx, field, val) {
+  if (!state.catalog[idx]) return;
+  state.catalog[idx][field] = parseFloat(val)||0;
+  saveAll();
+}
+
+function removeCatalogItem(idx) {
+  if (!confirm(`Remover "${state.catalog[idx]?.name}" do catálogo?`)) return;
+  state.catalog.splice(idx, 1);
+  saveAll(); renderCatalog();
+}
+
+function addCatalogItem() {
+  const name = safeStr(document.getElementById('nc-name').value);
+  const cat  = safeStr(document.getElementById('nc-category').value).toUpperCase();
+  const min  = parseFloat(document.getElementById('nc-min').value)||0;
+  const max  = parseFloat(document.getElementById('nc-max').value)||0;
+  const dur  = parseInt(document.getElementById('nc-duration').value)||0;
+  if (!name) { alert('Informe o nome do serviço.'); return; }
+  if (max < min) { alert('O valor máximo deve ser maior que o mínimo.'); return; }
+  state.catalog.push({ category: cat||'OUTROS', name, min, max, duration: dur||undefined });
+  document.getElementById('nc-name').value = document.getElementById('nc-category').value =
+    document.getElementById('nc-min').value = document.getElementById('nc-max').value =
+    document.getElementById('nc-duration').value = '';
+  saveAll(); renderCatalog();
+}
+
+function resetCatalog() {
+  if (!confirm('Restaurar o catálogo padrão? Seus serviços personalizados serão perdidos.')) return;
+  state.catalog = JSON.parse(JSON.stringify(DEFAULT_CATALOG));
+  saveAll(); renderCatalog();
+}
+
+/* ============================================================
+   CLIENTES
+   ============================================================ */
+function populateClientSelect() {
+  // Se há um clientId salvo no estado, exibe o box de info do cliente
+  if (state.clientId) {
+    const c = state.clients.find(c=>c.id===state.clientId);
+    if (c) showClientInfoBox(c);
+  }
+}
+
+function onClientNameInput(val) {
+  state.clientName = val;
+  updateTexts(); saveAll();
+
+  const term = val.toLowerCase().trim();
+  const box = document.getElementById('client-autocomplete');
+
+  // limpa clientId se o usuário está digitando livremente
+  if (state.clientId) {
+    const linked = state.clients.find(c=>c.id===state.clientId);
+    if (linked && linked.name.toLowerCase() !== term) {
+      state.clientId = null;
+      document.getElementById('client-info-box').classList.add('hidden');
+    }
+  }
+
+  if (term.length < 1 || !state.clients.length) { box.classList.add('hidden'); return; }
+
+  const found = state.clients.filter(c =>
+    c.name.toLowerCase().includes(term) ||
+    (c.phone||'').includes(term) ||
+    (c.address||'').toLowerCase().includes(term)
+  ).slice(0,6);
+
+  if (!found.length) { box.classList.add('hidden'); return; }
+
+  box.innerHTML = found.map(c => `
+    <div class="p-3 hover:bg-slate-50 cursor-pointer border-b border-slate-100 last:border-0 flex items-center gap-2"
+         data-client-id="${c.id}">
+      <div class="flex-1">
+        <span class="block text-sm font-semibold text-slate-700">${escHtml(c.name)}</span>
+        ${c.phone||c.address ? `<span class="text-xs text-slate-400">${[c.phone,c.address].filter(Boolean).join(' · ')}</span>` : ''}
+      </div>
+      <span class="text-blue-400 text-xs font-medium">usar</span>
+    </div>`).join('');
+
+  box.querySelectorAll('[data-client-id]').forEach(el => {
+    el.addEventListener('click', () => {
+      const c = state.clients.find(c=>c.id===el.dataset.clientId);
+      if (!c) return;
+      state.clientId   = c.id;
+      state.clientName = c.name;
+      document.getElementById('client-name').value = c.name;
+      box.classList.add('hidden');
+      showClientInfoBox(c);
+      updateTexts(); saveAll();
+    });
+  });
+
+  box.classList.remove('hidden');
+}
+
+function showClientInfoBox(c) {
+  const infoBox = document.getElementById('client-info-box');
+  infoBox.classList.remove('hidden');
+  infoBox.innerHTML = [
+    c.name    ? `<p>👤 <strong>${escHtml(c.name)}</strong></p>` : '',
+    c.phone   ? `<p>📱 ${escHtml(c.phone)}</p>` : '',
+    c.address ? `<p>📍 ${escHtml(c.address)}</p>` : '',
+    c.notes   ? `<p>📝 ${escHtml(c.notes)}</p>` : '',
+  ].join('');
+}
+
+
+function saveClient() {
+  const name = safeStr(document.getElementById('cf-name').value);
+  if (!name) { alert('Informe ao menos o nome do cliente.'); return; }
+  const editingId = document.getElementById('cf-editing-id').value;
+
+  if (editingId) {
+    const c = state.clients.find(c=>c.id===editingId);
+    if (c) {
+      c.name    = name;
+      c.phone   = safeStr(document.getElementById('cf-phone').value);
+      c.address = safeStr(document.getElementById('cf-address').value);
+      c.notes   = safeStr(document.getElementById('cf-notes').value);
+    }
+  } else {
+    state.clients.push({
+      id:      makeId(),
+      name,
+      phone:   safeStr(document.getElementById('cf-phone').value),
+      address: safeStr(document.getElementById('cf-address').value),
+      notes:   safeStr(document.getElementById('cf-notes').value),
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  saveAll(); populateClientSelect(); renderClients(); cancelEditClient();
+}
+
+function editClient(id) {
+  const c = state.clients.find(c=>c.id===id); if (!c) return;
+  document.getElementById('cf-name').value    = c.name;
+  document.getElementById('cf-phone').value   = c.phone||'';
+  document.getElementById('cf-address').value = c.address||'';
+  document.getElementById('cf-notes').value   = c.notes||'';
+  document.getElementById('cf-editing-id').value = id;
+  document.getElementById('client-form-title').innerText = '✏️ Editar Cliente';
+  document.getElementById('cf-cancel-btn').classList.remove('hidden');
+  document.getElementById('cf-name').focus();
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+
+function cancelEditClient() {
+  ['cf-name','cf-phone','cf-address','cf-notes'].forEach(id => document.getElementById(id).value='');
+  document.getElementById('cf-editing-id').value = '';
+  document.getElementById('client-form-title').innerText = '➕ Novo Cliente';
+  document.getElementById('cf-cancel-btn').classList.add('hidden');
+}
+
+function deleteClient(id) {
+  const c = state.clients.find(c=>c.id===id);
+  if (!confirm(`Excluir o cliente "${c?.name}"? O histórico de orçamentos dele não será apagado.`)) return;
+  state.clients = state.clients.filter(c=>c.id!==id);
+  saveAll(); populateClientSelect(); renderClients();
+}
+
+function renderClients() {
+  document.getElementById('clients-count').innerText = state.clients.length;
+  const list = document.getElementById('clients-list');
+
+  if (!state.clients.length) {
+    list.innerHTML = `<div class="card p-10 text-center text-slate-400 italic">nenhum cliente cadastrado ainda.</div>`;
+    return;
+  }
+
+  const term = (document.getElementById('clients-search')?.value || '').toLowerCase().trim();
+  const filtered = term
+    ? state.clients.filter(c =>
+        c.name.toLowerCase().includes(term) ||
+        (c.phone   || '').toLowerCase().includes(term) ||
+        (c.address || '').toLowerCase().includes(term) ||
+        (c.notes   || '').toLowerCase().includes(term)
+      )
+    : state.clients;
+
+  if (!filtered.length) {
+    list.innerHTML = `<div class="card p-10 text-center text-slate-400 italic">nenhum cliente encontrado para "<strong>${escHtml(term)}</strong>".</div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map(c => {
+    const cQuotes = state.quotes.filter(q => q.clientId===c.id);
+    const totalValue = cQuotes.filter(q=>q.status==='concluido').reduce((sum,q)=>sum+q.grandTotal,0);
+    
+    return `<div class="client-card" id="ccard-${c.id}">
+      <div class="client-card-head" data-toggle="client" data-id="${c.id}">
+        <div class="flex-1">
+          <p class="font-semibold text-slate-800 text-sm">${escHtml(c.name)}</p>
+          <div class="text-xs text-slate-500 mt-0.5 space-x-2">
+            ${c.phone?`<span>📱 ${escHtml(c.phone)}</span>`:''}
+            ${cQuotes.length?`<span>· ${cQuotes.length} orç.</span>`:''}
+            ${totalValue>0?`<span>· ${fBRL(totalValue)}</span>`:''}
+          </div>
+        </div>
+        <svg class="w-5 h-5 text-slate-400 chevron" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </div>
+      <div class="client-card-body">
+        ${c.address?`<p class="text-xs text-slate-600 mb-2">📍 ${escHtml(c.address)}</p>`:''}
+        ${c.notes?`<p class="text-xs text-slate-600 mb-2">📝 ${escHtml(c.notes)}</p>`:''}
+
+        ${cQuotes.length ? `
+          <div class="mb-3">
+            <p class="label-xs mb-1">histórico de orçamentos</p>
+            ${cQuotes.slice(0,5).map(q=>`
+              <div class="flex justify-between text-xs text-slate-600 py-1 border-b border-slate-100">
+                <span>${new Date(q.savedAt).toLocaleDateString('pt-BR')} · <span class="badge badge-${q.status}">${STATUS_LABELS[q.status]}</span></span>
+                <span class="font-mono font-semibold">${fBRL(q.grandTotal)}</span>
+              </div>`).join('')}
+            ${cQuotes.length>5?`<p class="text-xs text-slate-400 mt-1">+ ${cQuotes.length-5} mais…</p>`:''}
+          </div>` : ''}
+
+        <div class="flex gap-2">
+          <button onclick="editClient('${c.id}')"
+            class="text-xs px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg transition font-medium">editar</button>
+          <button onclick="deleteClient('${c.id}')"
+            class="text-xs px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg transition font-medium ml-auto">excluir</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function toggleClientCard(id) {
+  const card = document.getElementById('ccard-'+id);
+  if (!card) return;
+  card.classList.toggle('open');
+  if (card.classList.contains('open')) {
+    setTimeout(() => {
+      const navH = window.innerWidth < 768 ? 80 : 0;
+      const cardBottom = card.getBoundingClientRect().bottom;
+      const viewportH  = window.innerHeight - navH;
+      if (cardBottom > viewportH) {
+        window.scrollBy({ top: cardBottom - viewportH + 16, behavior: 'smooth' });
+      }
+    }, 50); // aguarda o display:block renderizar
+  }
+}
+
+/* ============================================================
+   VEÍCULO PRESET (único — compartilhado entre aba principal e modal de edição)
+   ============================================================ */
+const VEHICLE_PRESETS = {
+  carro_gas:[10,6.20,0.22], carro_eta:[7.5,4.50,0.22],
+  moto_gas:[25,6.20,0.12],  pickup:[8,6.20,0.30], custom:[null,null,null]
+};
+function applyVehiclePreset() {
+  const [c,f,m] = VEHICLE_PRESETS[document.getElementById('trav-vehicle').value]||[null,null,null];
+  if (c!=null) document.getElementById('trav-cons').value  = c;
+  if (f!=null) document.getElementById('trav-fuel').value  = f;
+  if (m!=null) document.getElementById('trav-maint').value = m;
+  updateTravel();
+}
+
+/* ============================================================
+   DESLOCAMENTO
+   ============================================================ */
+// Cálculo puro — usado tanto pela aba principal quanto pelo modal de edição
+function calcTravelFromValues(dist, mult, cons, fuel, maint) {
+  const totalKm   = dist * mult;
+  const fuelCost  = totalKm / cons * fuel;
+  const maintCost = totalKm * maint;
+  return { totalKm, fuelCost, maintCost, travelCost: fuelCost + maintCost };
+}
+
+function calcTravel() {
+  return calcTravelFromValues(
+    parseFloat(document.getElementById('trav-distance').value)||0,
+    parseInt(document.getElementById('trav-round').value)||1,
+    parseFloat(document.getElementById('trav-cons').value)||10,
+    parseFloat(document.getElementById('trav-fuel').value)||0,
+    parseFloat(document.getElementById('trav-maint').value)||0
+  );
+}
+
+function syncTravelState() {
+  state.travel.distance    = parseFloat(document.getElementById('trav-distance').value)||0;
+  state.travel.roundTrip   = parseInt(document.getElementById('trav-round').value)||1;
+  state.travel.vehicle     = document.getElementById('trav-vehicle').value;
+  state.travel.consumption = parseFloat(document.getElementById('trav-cons').value)||10;
+  state.travel.fuelPrice   = parseFloat(document.getElementById('trav-fuel').value)||0;
+  state.travel.maintenance = parseFloat(document.getElementById('trav-maint').value)||0;
+  state.travel.mode        = document.getElementById('trav-mode').value;
+}
+
+function updateTravel() {
+  const { totalKm, fuelCost, maintCost, travelCost } = calcTravel();
+  document.getElementById('br-dist').innerText      = `${totalKm.toFixed(1)} km`;
+  document.getElementById('br-fuel-val').innerText  = fBRL(fuelCost);
+  document.getElementById('br-maint-val').innerText = fBRL(maintCost);
+  document.getElementById('br-total').innerText     = fBRL(travelCost);
+  syncTravelState();
+
+  const mode = state.travel.mode;
+  const dilNote = document.getElementById('br-diluted-note');
+  const dilPer  = document.getElementById('br-diluted-per');
+  if (state.travel.enabled && mode==='diluted' && travelCost>0 && state.services.length) {
+    dilNote.classList.remove('hidden');
+    if (dilPer) dilPer.innerText = fBRL(travelCost / state.services.length);
+  } else {
+    dilNote.classList.add('hidden');
+  }
+  document.getElementById('trav-line-wrap').classList.toggle('d-none', !(state.travel.enabled && mode==='visible'));
+
+  updateTotals(); updateTexts(); saveAll();
+}
+
+function applyTravelToUI() {
+  const t = state.travel;
+  document.getElementById('trav-distance').value = t.distance||'';
+  document.getElementById('trav-round').value    = t.roundTrip||2;
+  document.getElementById('trav-vehicle').value  = t.vehicle||'carro_gas';
+  document.getElementById('trav-cons').value     = t.consumption||10;
+  document.getElementById('trav-fuel').value     = t.fuelPrice||6.20;
+  document.getElementById('trav-maint').value    = t.maintenance||0.20;
+  document.getElementById('trav-mode').value     = t.mode||'visible';
+  const tog = document.getElementById('trav-toggle');
+  tog.classList.toggle('on', !!t.enabled);
+  document.getElementById('trav-line-wrap').classList.toggle('d-none', !(t.enabled && t.mode==='visible'));
+  updateTravel();
+}
+
+document.getElementById('trav-toggle').addEventListener('click', () => {
+  state.travel.enabled = !state.travel.enabled;
+  document.getElementById('trav-toggle').classList.toggle('on', state.travel.enabled);
+  const mode = document.getElementById('trav-mode').value;
+  document.getElementById('trav-line-wrap').classList.toggle('d-none', !(state.travel.enabled && mode==='visible'));
+  updateTotals(); updateTexts(); saveAll();
+});
+
+['trav-distance','trav-round','trav-cons','trav-fuel','trav-maint'].forEach(id => {
+  document.getElementById(id).addEventListener('input', updateTravel);
+  document.getElementById(id).addEventListener('change', updateTravel);
+});
+
+/* ============================================================
+   BUSCA DE SERVIÇOS
+   ============================================================ */
+const searchInput   = document.getElementById('search-input');
+const searchResults = document.getElementById('search-results');
+
+searchInput.addEventListener('input', e => {
+  const term = e.target.value.toLowerCase().trim();
+  if (term.length < 2) { searchResults.classList.add('hidden'); return; }
+  const found = state.catalog.filter(s => s.name.toLowerCase().includes(term) || s.category.toLowerCase().includes(term));
+  if (!found.length) { searchResults.classList.add('hidden'); return; }
+
+  searchResults.innerHTML = found.map((s, idx) => `
+    <div class="search-result-item p-3 hover:bg-slate-50 cursor-pointer border-b border-slate-100 flex justify-between items-center"
+         data-service-index="${idx}">
+      <div>
+        <span class="block text-sm font-semibold text-slate-700">${escHtml(s.name)}</span>
+        <span class="text-xs text-slate-400">${s.category} · ${fBRL(s.min)} – ${fBRL(s.max)}</span>
+      </div>
+      <span class="text-blue-500 font-bold text-lg">+</span>
+    </div>`).join('');
+
+  searchResults.querySelectorAll('.search-result-item').forEach((item, idx) => {
+    item.addEventListener('click', () => addServiceByIndex(idx, found));
+  });
+
+  searchResults.classList.remove('hidden');
+});
+
+document.addEventListener('click', e => {
+  if (!searchInput.contains(e.target) && !searchResults.contains(e.target))
+    searchResults.classList.add('hidden');
+});
+
+/* ============================================================
+   SERVIÇOS SELECIONADOS
+   ============================================================ */
+function addServiceByIndex(idx, foundServices) {
+  const svc = foundServices[idx];
+  if (!svc) return;
+  state.services.push({...svc, id:makeId(), currentVal:svc.min, notes:'', materialCost:0, embedMaterial:false});
+  searchInput.value=''; 
+  searchResults.classList.add('hidden');
+  renderServicesList(); 
+  updateTotals();
+  updateTexts();
+  saveAll();
+}
+
+function toggleEmbedMaterial(id, checked) {
+  const s = state.services.find(s=>s.id===id);
+  if (s) { s.embedMaterial = checked; updateTotals(); updateTexts(); saveAll(); }
+}
+
+
+function removeService(id) {
+  state.services = state.services.filter(s=>s.id!==id);
+  renderServicesList(); saveAll();
+}
+
+function updatePrice(id, val) {
+  const s = state.services.find(s=>s.id===id); if (!s) return;
+  let v = parseFloat(val); if (isNaN(v)) return;
+  v = Math.min(s.max, Math.max(s.min, v)); s.currentVal = v;
+  const el = document.getElementById('price-lbl-'+id);
+  if (el) el.innerText = fBRL5(v);
+  updateTotals(); updateTexts(); saveAll();
+}
+
+function normalizePrice(id, val) {
+  const s = state.services.find(s=>s.id===id); if (!s) return;
+  let v = parseFloat(val); if (isNaN(v)) v = s.min;
+  v = Math.min(s.max, Math.max(s.min, v)); s.currentVal = v;
+  const inp = document.getElementById('inp-'+id); if (inp) inp.value = v;
+  const el  = document.getElementById('price-lbl-'+id); if (el) el.innerText = fBRL5(v);
+  updateTotals(); updateTexts(); saveAll();
+}
+
+function updateNotes(id, val) {
+  const s = state.services.find(s=>s.id===id); if (s) { s.notes=val; updateTexts(); saveAll(); }
+}
+
+function updateDuration(id, val) {
+  const s = state.services.find(s=>s.id===id); if (s) { s.duration=parseInt(val)||0; updateTotals(); updateTexts(); saveAll(); }
+}
+
+function updateMaterialCost(id, val) {
+  const s = state.services.find(s=>s.id===id);
+  if (s) { s.materialCost=parseFloat(val)||0; updateTotals(); updateTexts(); saveAll(); }
+}
+
+function toggleDetail(id) {
+  document.getElementById('svc-detail-'+id)?.classList.toggle('hidden');
+}
+
+function renderServicesList() {
+  const list = document.getElementById('selected-list');
+  if (!state.services.length) {
+    list.innerHTML=`<p class="text-slate-400 italic text-sm">nenhum serviço adicionado ainda.</p>`;
+    updateTotals(); updateTexts(); return;
+  }
+  list.innerHTML = state.services.map(s => `
+    <div class="svc-item">
+      <div class="flex justify-between items-start mb-2">
+        <span class="text-sm font-bold text-slate-700">${escHtml(s.name)}</span>
+        <div class="flex items-center gap-1">
+          <button onclick="toggleDetail('${s.id}')" class="text-slate-400 hover:text-slate-600 text-xs px-1.5 py-0.5 rounded bg-slate-100 hover:bg-slate-200 transition" title="notas e custo de material">✏️</button>
+          <button onclick="removeService('${s.id}')" class="text-red-400 hover:text-red-600 ml-1" aria-label="remover">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <input id="inp-${s.id}" type="number" min="${s.min}" max="${s.max}" value="${s.currentVal}"
+          class="fi w-28 font-mono font-bold text-slate-700"
+          oninput="updatePrice('${s.id}',this.value)"
+          onblur="normalizePrice('${s.id}',this.value)" />
+        <span id="price-lbl-${s.id}" class="text-sm font-mono font-bold text-blue-600 flex-1 text-right">${fBRL5(s.currentVal)}</span>
+      </div>
+      <p class="text-xs text-slate-400 mt-1">faixa: ${fBRL(s.min)} – ${fBRL(s.max)}</p>
+      <div id="svc-detail-${s.id}" class="hidden mt-2 space-y-2 pt-2 border-t border-slate-200">
+        <div class="grid grid-cols-2 gap-2">
+          <div><label class="label-xs">📝 observação (aparece na proposta)</label>
+            <input type="text" placeholder="ex: parede de drywall" value="${escHtml(s.notes||'')}"
+              class="fi text-xs" oninput="updateNotes('${s.id}',this.value)" /></div>
+          <div><label class="label-xs">⏱️ tempo estimado (min)</label>
+            <input type="number" placeholder="ex: 45" min="0" step="5" value="${s.duration||''}"
+              class="fi text-xs" oninput="updateDuration('${s.id}',this.value)" /></div>
+        </div>
+        <div>
+          <label class="label-xs">💰 custo de material estimado (R$)
+            <span class="text-blue-400 cursor-help ml-1" title="Usado apenas para calcular sua margem no painel. O cliente não vê este valor.">ⓘ</span>
+          </label>
+          <input type="number" placeholder="0" min="0" step="0.01" value="${s.materialCost||''}"
+            class="fi text-xs" oninput="updateMaterialCost('${s.id}',this.value)" />
+        </div>
+        <div>
+          <label class="label-xs flex items-center gap-2">
+            <input type="checkbox" ${s.embedMaterial?'checked':''} onchange="toggleEmbedMaterial('${s.id}',this.checked)" />
+            <span>embutir custo de material no preço cobrado</span>
+          </label>
+          <p class="text-xs text-slate-400 mt-0.5">quando marcado, o preço cobrado já inclui o material — cliente não vê separado.</p>
+        </div>
+      </div>
+    </div>`).join('');
+  updateTotals(); updateTexts();
+}
+
+/* ============================================================
+   TOTAIS
+   ============================================================ */
+function updateTotals() {
+  const { travelCost } = calcTravel();
+  const travAmt = state.travel.enabled ? travelCost : 0;
+  const mode = state.travel.mode;
+
+  // Calcula preço de cada serviço (com material embutido + fração de deslocamento diluído)
+  const travPerSvc = (state.travel.enabled && mode==='diluted' && state.services.length)
+    ? travAmt / state.services.length : 0;
+
+  let svcTotal = 0;
+  state.services.forEach(s => {
+    const base = Number(s.currentVal)||0;
+    const mat  = s.embedMaterial ? (Number(s.materialCost)||0) : 0;
+    svcTotal  += base + mat + travPerSvc;
+  });
+
+  const visibleTrav = (state.travel.enabled && mode==='visible') ? travAmt : 0;
+  const grand = svcTotal + visibleTrav;
+
+  document.getElementById('subtotal-val').innerText  = fBRL5(svcTotal);
+  document.getElementById('trav-line-val').innerText = fBRL5(visibleTrav);
+  document.getElementById('total-val').innerText     = fBRL5(grand);
+
+  // tempo estimado
+  const totalMins = state.services.reduce((a,s)=>a+(s.duration||0),0);
+  const timeLine = document.getElementById('time-estimate-line');
+  const timeVal  = document.getElementById('time-estimate-val');
+  if (totalMins > 0) {
+    const h=Math.floor(totalMins/60), m=totalMins%60;
+    timeVal.innerText = h>0?(m>0?`${h}h ${m}min`:`${h}h`):`${m}min`;
+    timeLine.style.display='flex';
+  } else {
+    timeLine.style.display='none';
+  }
+}
+
+/* ============================================================
+   SUGESTÕES
+   ============================================================ */
+function getUpsell() {
+  if (!state.services.length) return [];
+  const names = state.services.map(s=>s.name.toLowerCase());
+  const s = new Set();
+  if (names.some(n=>n.includes('torneira')||n.includes('sifão')||n.includes('válvula')||n.includes('flexível')||n.includes('vazamento')))
+    s.add('revisar sifão + ralo da pia + engates flexíveis (previne vazamentos futuros)');
+  if (names.some(n=>n.includes('ralo')||n.includes('pia')||n.includes('desentup')))
+    s.add('vedação/selagem em áreas críticas (box/pia) para evitar infiltrações');
+  if (names.some(n=>n.includes('descarga')||n.includes('assento')||n.includes('banheiro')))
+    s.add('verificar registro/boia e ruídos de vazamento (economiza água)');
+  if (names.some(n=>n.includes('chuveiro')))
+    s.add('checar disjuntor e conexões do ponto do chuveiro (segurança)');
+  if (names.some(n=>n.includes('tomada')||n.includes('interruptor')||n.includes('luminária')||n.includes('soquete')))
+    s.add('revisar aperto e aquecimento em 1 ponto elétrico extra (segurança)');
+  if (names.some(n=>n.includes('ventilador')))
+    s.add('conferir balanceamento e fixação (reduz ruído, aumenta durabilidade)');
+  if (names.some(n=>n.includes('suporte de tv')||n.includes('prateleira')||n.includes('espelho')))
+    s.add('reforçar fixação extra (bucha correta) para evitar queda');
+  if (names.some(n=>n.includes('cortina')||n.includes('varão')||n.includes('persiana')))
+    s.add('nivelamento fino e alinhamento extra (acabamento premium)');
+  return Array.from(s).slice(0,3);
+}
+
+function renderUpsell() {
+  const ul = document.getElementById('upsell-list');
+  const items = getUpsell();
+  ul.innerHTML = items.length
+    ? items.map(i=>`<li>${i}</li>`).join('')
+    : `<li class="text-slate-400 italic">adicione um serviço para ver sugestões.</li>`;
+}
+
+/* ============================================================
+   PROPOSTA
+   ============================================================ */
+function buildProposalText(dateOverride) {
+  const { totalKm, fuelCost, maintCost, travelCost } = calcTravel();
+  const travEnabled = state.travel.enabled;
+  const mode = state.travel.mode;
+  const travAmt = travEnabled ? travelCost : 0;
+  const travPerSvc = (travEnabled && mode==='diluted' && state.services.length)
+    ? travAmt / state.services.length : 0;
+
+  const client  = safeStr(state.clientName);
+  const dateStr = dateOverride || new Date().toLocaleDateString('pt-BR');
+  const cfg     = state.config;
+
+  let t = `*Orçamento de Prestação de Serviços*\n`;
+  t += `${cfg.ownerName}${cfg.city ? ' · '+cfg.city : ''}\n`;
+  if (cfg.phone) t += `Tel.: ${cfg.phone}\n`;
+  t += `\n`;
+  if (client) t += `Cliente: ${client}\n`;
+  t += `Data: ${dateStr}\n\n`;
+
+  let grandTotal = 0;
+  state.services.forEach(s => {
+    const base = Number(s.currentVal)||0;
+    const mat  = s.embedMaterial ? (Number(s.materialCost)||0) : 0;
+    const shown = base + mat + travPerSvc;
+    grandTotal += shown;
+    t += `- ${s.name}\n`;
+    if (s.notes) t += `  Obs.: ${s.notes}\n`;
+    t += `  Valor: ${fBRL5(shown)}\n\n`;
+  });
+
+  // Deslocamento visível
+  if (travEnabled && mode==='visible' && travelCost>0) {
+    grandTotal += travelCost;
+    t += `*Deslocamento* (${totalKm.toFixed(1)} km)\n`;
+    t += `  Combustível: ${fBRL(fuelCost)}\n`;
+    t += `  Manutenção veículo: ${fBRL(maintCost)}\n`;
+    t += `  Subtotal deslocamento: ${fBRL(travelCost)}\n\n`;
+  }
+
+  t += `*Total: ${fBRL5(grandTotal)}*\n\n`;
+  t += `*Observações:*\n`;
+  t += `- Início após aprovação.\n`;
+  t += `- Garantia de ${cfg.guarantee}${cfg.guarantee.includes('meses')||cfg.guarantee.includes('ano')?'':' meses'} (não cobre mau uso, desgaste natural ou peças de terceiros).\n`;
+  t += `- Materiais não inclusos (exceto se combinado o contrário).\n`;
+  if (cfg.pixKey) t += `- Pagamento à vista via *Pix* (${cfg.pixType}: ${cfg.pixKey}) ou dinheiro.\n`;
+  else t += `- Pagamento à vista via *Pix* ou dinheiro.\n`;
+  t += `\nPodemos prosseguir? Aguardo seu retorno.`;
+  return t;
+}
+
+function updateTexts() {
+  renderUpsell();
+  const proposalBox = document.getElementById('proposal-content');
+
+  if (!state.services.length) {
+    proposalBox.innerText='Selecione os serviços para gerar a proposta.';
+    return;
+  }
+
+  proposalBox.innerText = buildProposalText('(data inserida ao copiar)');
+}
+
+/* ============================================================
+   HISTÓRICO
+   ============================================================ */
+const STATUS_LABELS = {
+  enviado:'enviado', aprovado:'aprovado', em_execucao:'em execução', concluido:'concluído', perdido:'perdido'
+};
+
+function saveToHistory() {
+  if (!state.services.length) { alert('Adicione pelo menos um serviço antes de salvar.'); return; }
+  syncTravelState();
+  const { travelCost, fuelCost, maintCost } = calcTravel();
+  const travAmt  = state.travel.enabled ? travelCost : 0;
+  const mode     = state.travel.mode;
+  const travPerSvc = (state.travel.enabled && mode==='diluted' && state.services.length)
+    ? travAmt / state.services.length : 0;
+  const visibleTrav = (state.travel.enabled && mode==='visible') ? travAmt : 0;
+
+  let svcTotal = 0;
+  state.services.forEach(s => {
+    const base = Number(s.currentVal)||0;
+    const mat  = s.embedMaterial ? (Number(s.materialCost)||0) : 0;
+    svcTotal  += base + mat + travPerSvc;
+  });
+  const grand = svcTotal + visibleTrav;
+
+  const client = safeStr(document.getElementById('client-name').value) || state.clientName;
+  state.clientName = client;
+
+  state.quotes.unshift({
+    id:           makeId(),
+    savedAt:      new Date().toISOString(),
+    clientName:   client,
+    clientId:     state.clientId||null,
+    status:       'enviado',
+    services:     JSON.parse(JSON.stringify(state.services)),
+    travel:       JSON.parse(JSON.stringify(state.travel)),
+    travelCost:   travAmt,
+    fuelCost:     state.travel.enabled ? fuelCost  : 0,
+    maintCost:    state.travel.enabled ? maintCost : 0,
+    totalServices: svcTotal,
+    grandTotal:   grand,
+    proposalText: buildProposalText(),
+  });
+
+  saveAll();
+  alert(`✅ Orçamento de ${client||'sem nome'} (${fBRL(grand)}) salvo!`);
+  if (state.activeTab!=='historico') switchTab('historico'); else renderHistory();
+}
+
+function renderHistory() {
+  const filter = document.getElementById('hist-filter').value;
+  const term   = (document.getElementById('hist-search').value||'').toLowerCase();
+  let quotes   = state.quotes;
+  if (filter) quotes = quotes.filter(q=>q.status===filter);
+  if (term)   quotes = quotes.filter(q=>(q.clientName||'').toLowerCase().includes(term));
+
+  const concluded = state.quotes.filter(q=>q.status==='concluido').length;
+  document.getElementById('hist-summary').innerText =
+    `${state.quotes.length} orçamento${state.quotes.length!==1?'s':''} · ${concluded} concluído${concluded!==1?'s':''}`;
+
+  const list = document.getElementById('history-list');
+  if (!quotes.length) {
+    list.innerHTML=`<div class="card p-10 text-center text-slate-400 italic">${filter||term?'nenhum resultado.':'nenhum orçamento salvo ainda.'}</div>`;
+    return;
+  }
+
+  list.innerHTML = quotes.map(q => {
+    const dt = new Date(q.savedAt);
+    const showAppt = ['aprovado','em_execucao','concluido'].includes(q.status);
+    const hasAppt  = !!(q.appointmentDate && q.appointmentTime);
+
+    // linha de agendamento no header (só aparece quando já tem data marcada)
+    const apptHeaderLine = hasAppt ? (() => {
+      const [y,mo,d] = q.appointmentDate.split('-');
+      return `<span class="text-xs text-green-600 font-semibold">📅 ${d}/${mo}/${y} às ${q.appointmentTime}</span>`;
+    })() : '';
+
+    // duração estimada padrão (soma dos serviços, ou 60 min)
+    const estimatedDur = (q.services||[]).reduce((a,s)=>a+(s.duration||0),0) || 60;
+
+    return `<div class="quote-card" id="qcard-${q.id}">
+      <div class="quote-card-head" data-toggle="quote" data-id="${q.id}">
+        <div class="flex-1">
+          <div class="flex items-center gap-2 mb-1 flex-wrap">
+            <span class="font-semibold text-slate-800">${escHtml(q.clientName||'sem nome')}</span>
+            <span class="badge badge-${q.status}">${STATUS_LABELS[q.status]}</span>
+            ${apptHeaderLine}
+          </div>
+          <div class="text-xs text-slate-500">
+            ${dt.toLocaleDateString('pt-BR')} às ${dt.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})} · 
+            ${q.services?.length||0} serviço${(q.services?.length||0)!==1?'s':''} · 
+            <span class="font-semibold">${fBRL(q.grandTotal)}</span>
+          </div>
+        </div>
+        <svg class="w-5 h-5 text-slate-400 chevron" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </div>
+      <div class="quote-card-body">
+        <div class="mb-3">
+          <label class="label-xs mb-1">status</label>
+          <select class="fi text-xs" onchange="updateQuoteStatus('${q.id}',this.value)">
+            <option value="enviado" ${q.status==='enviado'?'selected':''}>enviado</option>
+            <option value="aprovado" ${q.status==='aprovado'?'selected':''}>aprovado</option>
+            <option value="em_execucao" ${q.status==='em_execucao'?'selected':''}>em execução</option>
+            <option value="concluido" ${q.status==='concluido'?'selected':''}>concluído</option>
+            <option value="perdido" ${q.status==='perdido'?'selected':''}>perdido</option>
+          </select>
+        </div>
+
+        ${showAppt ? `
+        <div class="appt-block ${hasAppt?'has-date':''} mb-3">
+          <p class="text-xs font-bold text-green-700 mb-2">📅 Agendamento do atendimento</p>
+          <div class="grid grid-cols-3 gap-2 mb-2">
+            <div>
+              <label class="label-xs">data</label>
+              <input type="date" class="fi text-xs" value="${q.appointmentDate||''}"
+                onchange="updateAppointment('${q.id}','date',this.value)" />
+            </div>
+            <div>
+              <label class="label-xs">horário</label>
+              <input type="time" class="fi text-xs" value="${q.appointmentTime||''}"
+                onchange="updateAppointment('${q.id}','time',this.value)" />
+            </div>
+            <div>
+              <label class="label-xs">duração (min)</label>
+              <input type="number" class="fi text-xs" min="15" step="15"
+                value="${q.appointmentDuration || estimatedDur}"
+                onchange="updateAppointment('${q.id}','duration',this.value)" />
+            </div>
+          </div>
+          <button onclick="openGoogleCalendar('${q.id}')"
+            ${hasAppt?'':' disabled title="Defina data e horário primeiro"'}
+            class="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-bold transition
+              ${hasAppt
+                ? 'bg-white border border-green-300 text-green-700 hover:bg-green-50 cursor-pointer'
+                : 'bg-slate-100 text-slate-400 cursor-not-allowed'}">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19.5 3h-2V1.5a.5.5 0 0 0-1 0V3h-9V1.5a.5.5 0 0 0-1 0V3h-2A2.5 2.5 0 0 0 2 5.5v14A2.5 2.5 0 0 0 4.5 22h15a2.5 2.5 0 0 0 2.5-2.5v-14A2.5 2.5 0 0 0 19.5 3ZM4.5 4h2v1.5a.5.5 0 0 0 1 0V4h9v1.5a.5.5 0 0 0 1 0V4h2A1.5 1.5 0 0 1 21 5.5V8H3V5.5A1.5 1.5 0 0 1 4.5 4ZM3 19.5V9h18v10.5A1.5 1.5 0 0 1 19.5 21h-15A1.5 1.5 0 0 1 3 19.5Z"/>
+            </svg>
+            ${hasAppt ? 'Abrir no Google Calendar' : 'Preencha data e horário para agendar'}
+          </button>
+          ${hasAppt ? `
+          <p class="mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 leading-relaxed">
+            💡 <strong>Lembre-se:</strong> após abrir o evento, adicione os lembretes manualmente —
+            <strong>24 horas antes</strong> e <strong>1 hora antes</strong> do atendimento.
+          </p>` : ''}
+        </div>` : ''}
+        <div class="mb-3">
+          <p class="label-xs mb-1">serviços</p>
+          ${(q.services||[]).map(s=>`
+            <div class="flex justify-between text-xs text-slate-600 py-1 border-b border-slate-100">
+              <span class="flex-1">${escHtml(s.name)}${s.notes?` (${escHtml(s.notes)})`:''}</span>
+              <span class="font-mono font-semibold ml-3">${fBRL(s.currentVal)}</span>
+              ${s.duration ? `<span class="text-slate-400 ml-2">⏱️ ${s.duration<60?s.duration+'min':Math.floor(s.duration/60)+'h'+(s.duration%60?s.duration%60+'min':'')}</span>` : ''}
+            </div>`).join('')}
+          ${(() => {
+            const totalMin = (q.services||[]).reduce((a,s)=>a+(s.duration||0),0);
+            if (!totalMin) return '';
+            const h = Math.floor(totalMin/60), m = totalMin%60;
+            const fmt = h>0 ? (m>0?`${h}h ${m}min`:`${h}h`) : `${m}min`;
+            return `<div class="flex justify-between text-xs font-semibold text-slate-500 pt-1.5 mt-0.5">
+              <span>⏱️ tempo total estimado</span><span>${fmt}</span>
+            </div>`;
+          })()}
+        </div>
+        ${(() => {
+          const mat   = (q.services||[]).reduce((a,s)=>a+(s.materialCost||0),0);
+          const fuel  = q.fuelCost  || 0;
+          const maint = q.maintCost || 0;
+          const totalCosts = mat + fuel + maint;
+          const profit = q.grandTotal - totalCosts;
+          const pct = q.grandTotal > 0 ? (profit/q.grandTotal*100).toFixed(0) : 0;
+          if (!mat && !fuel && !maint) return '';
+          return `<div class="mb-3 p-2.5 bg-slate-50 rounded-lg border border-slate-200 text-xs space-y-1">
+            <p class="font-bold text-slate-500 uppercase tracking-wide mb-1.5">custos deste orçamento</p>
+            ${mat   ? `<div class="flex justify-between text-slate-500"><span>🧱 material:</span><span class="font-mono text-red-400">${fBRL(mat)}</span></div>` : ''}
+            ${fuel  ? `<div class="flex justify-between text-slate-500"><span>⛽ combustível:</span><span class="font-mono text-red-400">${fBRL(fuel)}</span></div>` : ''}
+            ${maint ? `<div class="flex justify-between text-slate-500"><span>🔧 manutenção:</span><span class="font-mono text-red-400">${fBRL(maint)}</span></div>` : ''}
+            <div class="flex justify-between font-bold border-t border-slate-200 pt-1.5 text-slate-700">
+              <span>💰 lucro líquido:</span>
+              <span class="font-mono ${profit>=0?'text-green-600':'text-red-600'}">${fBRL(profit)} (${pct}%)</span>
+            </div>
+          </div>`;
+        })()}
+        <div class="flex gap-2">
+          <button onclick="openEditModal('${q.id}')"
+            class="text-xs px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg transition font-medium">✏️ editar</button>
+          <button onclick="copyQuoteText('${q.id}')"
+            class="text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg transition font-medium">copiar texto</button>
+          <button onclick="deleteQuote('${q.id}')"
+            class="text-xs px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg transition font-medium ml-auto">excluir</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function toggleQuoteCard(id) {
+  const card = document.getElementById('qcard-'+id);
+  if (!card) return;
+  card.classList.toggle('open');
+  if (card.classList.contains('open')) {
+    setTimeout(() => {
+      const navH = window.innerWidth < 768 ? 80 : 0;
+      const cardBottom = card.getBoundingClientRect().bottom;
+      const viewportH  = window.innerHeight - navH;
+      if (cardBottom > viewportH) {
+        window.scrollBy({ top: cardBottom - viewportH + 16, behavior: 'smooth' });
+      }
+    }, 50);
+  }
+}
+
+function updateQuoteStatus(id, status) {
+  const q = state.quotes.find(q=>q.id===id);
+  if (!q) return;
+  q.status = status;
+  saveAll();
+  renderHistory();
+  renderDashboard();
+  // reabre o card que estava aberto antes do re-render
+  document.getElementById('qcard-'+id)?.classList.add('open');
+}
+
+function updateAppointment(id, field, value) {
+  const q = state.quotes.find(q=>q.id===id);
+  if (!q) return;
+  if (field === 'date')     q.appointmentDate     = value;
+  if (field === 'time')     q.appointmentTime     = value;
+  if (field === 'duration') q.appointmentDuration = parseInt(value)||60;
+  saveAll();
+
+  // Atualiza o visual SEM re-renderizar o histórico (evita bug de reset do input durante digitação)
+  const card = document.getElementById('qcard-'+id);
+  if (!card) return;
+  const hasAppt = !!(q.appointmentDate && q.appointmentTime);
+
+  // atualiza classe do bloco de agendamento
+  const apptBlock = card.querySelector('.appt-block');
+  if (apptBlock) apptBlock.classList.toggle('has-date', hasAppt);
+
+  // atualiza botão do Google Calendar
+  const calBtn = card.querySelector('.appt-block button');
+  if (calBtn) {
+    if (hasAppt) {
+      calBtn.disabled = false;
+      calBtn.removeAttribute('title');
+      calBtn.className = 'w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-bold transition bg-white border border-green-300 text-green-700 hover:bg-green-50 cursor-pointer';
+      const btnText = calBtn.querySelector('span') || calBtn.lastChild;
+      if (btnText) btnText.textContent = 'Abrir no Google Calendar';
+      else calBtn.appendChild(document.createTextNode('Abrir no Google Calendar'));
+    } else {
+      calBtn.disabled = true;
+      calBtn.title = 'Defina data e horário primeiro';
+      calBtn.className = 'w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-bold transition bg-slate-100 text-slate-400 cursor-not-allowed';
+    }
+  }
+}
+
+function openGoogleCalendar(id) {
+  const q = state.quotes.find(q=>q.id===id);
+  if (!q || !q.appointmentDate || !q.appointmentTime) return;
+
+  // duração: usa o campo editável; cai na soma dos serviços; mínimo 60 min
+  const totalMins = q.appointmentDuration
+    || (q.services||[]).reduce((a,s)=>a+(s.duration||0),0)
+    || 60;
+
+  // monta data/hora de início e fim no formato YYYYMMDDTHHMMSS (sem UTC — usa horário local)
+  const [y,mo,d] = q.appointmentDate.split('-');
+  const [hh,mm]  = q.appointmentTime.split(':');
+  const start    = new Date(+y, +mo-1, +d, +hh, +mm);
+  const end      = new Date(start.getTime() + totalMins * 60000);
+  const fmt      = dt => dt.getFullYear().toString()
+    + String(dt.getMonth()+1).padStart(2,'0')
+    + String(dt.getDate()).padStart(2,'0') + 'T'
+    + String(dt.getHours()).padStart(2,'0')
+    + String(dt.getMinutes()).padStart(2,'0') + '00';
+
+  const svcList = (q.services||[]).map(s=>`• ${s.name}`).join('\n');
+  const details = [
+    svcList,
+    `\nValor: ${fBRL(q.grandTotal)}`,
+    state.config.phone ? `Contato: ${state.config.phone}` : '',
+    state.config.ownerName ? `Prestador: ${state.config.ownerName}` : '',
+  ].filter(Boolean).join('\n');
+
+  // endereço do cliente cadastrado (se houver)
+  const client   = q.clientId ? state.clients.find(c=>c.id===q.clientId) : null;
+  const location = client?.address || '';
+
+  const url = `https://calendar.google.com/calendar/render?action=TEMPLATE`
+    + `&text=${encodeURIComponent('Atendimento — ' + (q.clientName||'cliente'))}`
+    + `&dates=${fmt(start)}/${fmt(end)}`
+    + `&details=${encodeURIComponent(details)}`
+    + (location ? `&location=${encodeURIComponent(location)}` : '');
+
+  window.open(url, '_blank');
+}
+
+async function copyQuoteText(id) {
+  const q = state.quotes.find(q=>q.id===id);
+  if (!q) return;
+  const ok = await copyText(q.proposalText);
+  alert(ok?'✅ proposta copiada!':'❌ erro ao copiar.');
+}
+
+function deleteQuote(id) {
+  if (!confirm('Excluir este orçamento do histórico?')) return;
+  state.quotes = state.quotes.filter(q=>q.id!==id);
+  saveAll(); renderHistory(); renderDashboard();
+}
+
+/* ============================================================
+   DASHBOARD/PAINEL
+   ============================================================ */
+function addFixedCost() {
+  const name = safeStr(document.getElementById('new-cost-name').value);
+  const val  = parseFloat(document.getElementById('new-cost-value').value)||0;
+  if (!name) { alert('Informe o nome do custo.'); return; }
+  if (val<=0) { alert('Informe um valor maior que zero.'); return; }
+  state.fixedCosts.push({id:makeId(), name, value:val});
+  document.getElementById('new-cost-name').value = document.getElementById('new-cost-value').value = '';
+  saveAll(); renderDashboard();
+}
+
+function removeFixedCost(id) {
+  state.fixedCosts = state.fixedCosts.filter(c=>c.id!==id);
+  saveAll(); renderDashboard();
+}
+
+function renderDashboard() {
+  const now = new Date();
+  const month = now.toLocaleString('pt-BR',{month:'long',year:'numeric'});
+  document.getElementById('stats-month').innerText = month;
+
+  const thisMonthQuotes = state.quotes.filter(q => {
+    const d = new Date(q.savedAt);
+    return d.getMonth()===now.getMonth() && d.getFullYear()===now.getFullYear();
+  });
+
+  const approved = thisMonthQuotes.filter(q=>q.status==='aprovado'||q.status==='em_execucao'||q.status==='concluido').length;
+  const conversion = thisMonthQuotes.length>0 ? Math.round(approved/thisMonthQuotes.length*100) : 0;
+
+  const concluded = state.quotes.filter(q=>q.status==='concluido');
+  const revenue  = concluded.reduce((a,q)=>a+q.grandTotal,0);
+  const matCost  = concluded.reduce((a,q)=>a+q.services.reduce((s,i)=>s+(i.materialCost||0),0),0);
+  const fuelCostTotal  = concluded.reduce((a,q)=>a+(q.fuelCost||0),0);
+  const maintCostTotal = concluded.reduce((a,q)=>a+(q.maintCost||0),0);
+  const totalCosts = matCost + fuelCostTotal + maintCostTotal;
+  const margin    = revenue - totalCosts;
+  const marginPct = revenue>0 ? margin/revenue*100 : 0;
+
+  const monthConcluded = thisMonthQuotes.filter(q=>q.status==='concluido');
+  const monthRevenue   = monthConcluded.reduce((a,q)=>a+q.grandTotal,0);
+  const avgTicket      = monthConcluded.length>0 ? monthRevenue/monthConcluded.length : 0;
+
+  document.getElementById('stat-total-quotes').innerText = thisMonthQuotes.length;
+  document.getElementById('stat-conversion').innerText = conversion+'%';
+  document.getElementById('stat-revenue').innerText = fBRL(monthRevenue);
+  document.getElementById('stat-avg-ticket').innerText = fBRL(avgTicket);
+
+  // ── HORAS ──
+  const fmtHours = mins => {
+    if (!mins) return '0h';
+    const h = Math.floor(mins/60), m = mins%60;
+    return h>0 ? (m>0 ? `${h}h ${m}min` : `${h}h`) : `${m}min`;
+  };
+  const monthMins = thisMonthQuotes.reduce((a,q)=>{
+    return a + (q.services||[]).reduce((s,sv)=>s+(sv.duration||0),0);
+  }, 0);
+  const totalMins = state.quotes.reduce((a,q)=>{
+    return a + (q.services||[]).reduce((s,sv)=>s+(sv.duration||0),0);
+  }, 0);
+  document.getElementById('stat-hours').innerText       = fmtHours(monthMins);
+  document.getElementById('stat-hours-total').innerText = fmtHours(totalMins);
+
+  const fixedTotal = state.fixedCosts.reduce((a,c)=>a+c.value,0);
+  const fcList = document.getElementById('fixed-costs-list');
+  fcList.innerHTML = state.fixedCosts.length
+    ? state.fixedCosts.map(c=>`
+        <div class="flex justify-between items-center text-sm bg-slate-50 rounded-lg px-3 py-2">
+          <span class="text-slate-700">${escHtml(c.name)}</span>
+          <div class="flex items-center gap-2">
+            <span class="font-semibold font-mono text-slate-800">${fBRL(c.value)}</span>
+            <button onclick="removeFixedCost('${c.id}')" class="text-red-400 hover:text-red-600 text-xs">✕</button>
+          </div>
+        </div>`).join('')
+    : `<p class="text-xs text-slate-400 italic">nenhum custo fixo cadastrado.</p>`;
+
+  document.getElementById('pe-fixed-total').innerText = fBRL(fixedTotal);
+  document.getElementById('pe-revenue').innerText     = fBRL(revenue);
+
+  const peProgress = fixedTotal>0 ? Math.min(revenue/fixedTotal*100,100) : 0;
+  const peBar = document.getElementById('pe-bar');
+  peBar.style.width = peProgress+'%';
+  peBar.className = 'prog-fill'+(peProgress>=100?' ok':peProgress>=60?'':' warn');
+
+  const peStatus = document.getElementById('pe-status');
+  if (fixedTotal===0) { peStatus.innerText='cadastre seus custos fixos mensais acima.'; peStatus.className='text-xs text-center font-semibold text-slate-400'; }
+  else if (revenue>=fixedTotal) { peStatus.innerText=`✅ equilíbrio atingido! sobra ${fBRL(revenue-fixedTotal)}.`; peStatus.className='text-xs text-center font-semibold text-green-600'; }
+  else { peStatus.innerText=`faltam ${fBRL(fixedTotal-revenue)} para cobrir os custos fixos.`; peStatus.className='text-xs text-center font-semibold text-amber-600'; }
+
+  const grossProfit   = revenue - totalCosts;
+  const netProfit     = grossProfit - fixedTotal;
+  const netMarginPct  = revenue > 0 ? netProfit / revenue * 100 : 0;
+  const netColor      = netProfit >= 0 ? 'text-green-600' : 'text-red-600';
+
+  // valor/hora (baseado nos concluídos com duração preenchida)
+  const concludedMins = concluded.reduce((a,q)=>{
+    return a + (q.services||[]).reduce((s,sv)=>s+(sv.duration||0),0);
+  }, 0);
+  const concludedHours = concludedMins / 60;
+  const hourlyRate  = concludedHours > 0 ? revenue / concludedHours : null;
+  const netHourly   = concludedHours > 0 ? netProfit / concludedHours : null;
+
+  document.getElementById('stat-hourly').innerText = hourlyRate != null ? fBRL(hourlyRate)+'/h' : '—';
+
+  document.getElementById('mrg-revenue').innerText     = fBRL(revenue);
+  document.getElementById('mrg-cost').innerText        = fBRL(matCost);
+  document.getElementById('mrg-fuel').innerText        = fBRL(fuelCostTotal);
+  document.getElementById('mrg-maint').innerText       = fBRL(maintCostTotal);
+  document.getElementById('mrg-total-costs').innerText = fBRL(totalCosts);
+  document.getElementById('mrg-fixed').innerText       = fBRL(fixedTotal);
+  document.getElementById('mrg-gross-val').innerText   = fBRL(grossProfit);
+  const mrgEl = document.getElementById('mrg-gross');
+  mrgEl.innerText   = `${fBRL(netProfit)} (${netMarginPct.toFixed(0)}%)`;
+  mrgEl.className   = `font-mono ${netColor}`;
+  document.getElementById('mrg-hourly').innerText = netHourly != null ? fBRL(netHourly)+'/h' : '—';
+
+  // ── SERVIÇOS MAIS LUCRATIVOS ──
+  const svcMap = {};
+  state.quotes.filter(q=>q.status==='concluido').forEach(q => {
+    (q.services||[]).forEach(s => {
+      if (!svcMap[s.name]) svcMap[s.name] = { revenue:0, cost:0, count:0, hasMaterial:false };
+      svcMap[s.name].revenue += Number(s.currentVal)||0;
+      svcMap[s.name].cost    += Number(s.materialCost)||0;
+      if (s.materialCost) svcMap[s.name].hasMaterial = true;
+      svcMap[s.name].count++;
+    });
+  });
+
+  const topSvcs = Object.entries(svcMap)
+    .map(([name,v]) => ({ name, ...v, margin: v.revenue-v.cost, marginPct: v.revenue>0?(v.revenue-v.cost)/v.revenue*100:0 }))
+    .sort((a,b) => b.margin-a.margin)
+    .slice(0,10);
+
+  const svcEl = document.getElementById('top-services-list');
+  if (!topSvcs.length) {
+    svcEl.innerHTML=`<p class="text-sm text-slate-400 italic text-center py-4">nenhum serviço concluído ainda.</p>`;
+  } else {
+    const maxMargin = topSvcs[0].margin || 1;
+    svcEl.innerHTML = `
+      <div class="grid grid-cols-4 text-xs font-bold text-slate-400 uppercase tracking-wider pb-1 border-b border-slate-100">
+        <span class="col-span-2">serviço</span><span class="text-right">margem</span><span class="text-right">execuções</span>
+      </div>
+      ${topSvcs.map((s,i) => `
+        <div class="py-2 border-b border-slate-50 last:border-0">
+          <div class="flex justify-between items-center mb-1">
+            <span class="text-sm font-semibold text-slate-700">${i+1}. ${escHtml(s.name)}</span>
+            <div class="text-right">
+              <span class="text-sm font-bold ${s.marginPct>=50?'text-green-600':s.marginPct>=30?'text-amber-600':'text-red-500'}">${s.marginPct.toFixed(0)}%</span>
+              <span class="text-xs text-slate-400 ml-2">${fBRL(s.margin)}</span>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <div class="rank-bar-wrap"><div class="rank-bar-fill ${s.marginPct>=50?'green':''}" style="width:${Math.round(s.margin/maxMargin*100)}%"></div></div>
+            <span class="text-xs text-slate-400 w-8 text-right">${s.count}×</span>
+          </div>
+          <div class="text-xs text-slate-400 mt-0.5">
+            receita: ${fBRL(s.revenue)}
+            ${s.hasMaterial ? ` · material: ${fBRL(s.cost)}` : ' · <span class="text-slate-300">sem material registrado</span>'}
+          </div>
+        </div>`).join('')}`;
+  }
+
+  // ── CLIENTES POR RECEITA ──
+  const clientMap = {};
+  state.quotes.filter(q=>q.status==='concluido').forEach(q => {
+    const key   = q.clientId || q.clientName || '(sem nome)';
+    const label = q.clientName || '(sem nome)';
+    if (!clientMap[key]) clientMap[key] = { label, revenue:0, count:0, clientId: q.clientId||null };
+    clientMap[key].revenue += q.grandTotal||0;
+    clientMap[key].count++;
+  });
+
+  const topClients = Object.values(clientMap)
+    .sort((a,b)=>b.revenue-a.revenue)
+    .slice(0,8);
+
+  const clEl = document.getElementById('top-clients-list');
+  if (!topClients.length) {
+    clEl.innerHTML=`<p class="text-sm text-slate-400 italic text-center py-4">nenhum orçamento concluído ainda.</p>`;
+  } else {
+    const maxRev = topClients[0].revenue;
+    clEl.innerHTML = topClients.map((c,i) => `
+      <div class="py-1.5 border-b border-slate-50 last:border-0">
+        <div class="flex justify-between items-center mb-1">
+          <span class="text-sm font-semibold text-slate-700">${i+1}. ${escHtml(c.label)}</span>
+          <div class="text-right">
+            <span class="text-sm font-bold text-green-600">${fBRL(c.revenue)}</span>
+            <span class="text-xs text-slate-400 ml-1">(${c.count} serv.)</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <div class="rank-bar-wrap"><div class="rank-bar-fill green" style="width:${Math.round(c.revenue/maxRev*100)}%"></div></div>
+          <span class="text-xs text-slate-400 w-20 text-right">${fBRL(c.revenue/c.count)}/serv.</span>
+        </div>
+      </div>`).join('');
+  }
+}
+
+/* ============================================================
+   COPIAR / PDF / SHARE
+   ============================================================ */
+async function copyProposal() {
+  const ok = await copyText(buildProposalText());
+  alert(ok?'✅ proposta copiada!':'❌ erro ao copiar.');
+}
+
+
+
+
+
+
+/* ============================================================
+   EDIÇÃO DE ORÇAMENTOS
+   ============================================================ */
+let _editingQuoteId = null;
+let _editServices   = [];
+
+// usa VEHICLE_PRESETS global (definido acima, junto com applyVehiclePreset)
+
+function openEditModal(id) {
+  const q = state.quotes.find(q=>q.id===id);
+  if (!q) return;
+  _editingQuoteId = id;
+  _editServices   = JSON.parse(JSON.stringify(q.services||[]));
+
+  document.getElementById('eq-client').value = q.clientName||'';
+
+  // data do orçamento (usa savedAt; fallback para hoje)
+  const _savedDate = q.savedAt ? new Date(q.savedAt) : new Date();
+  const _yyyy = _savedDate.getFullYear();
+  const _mm   = String(_savedDate.getMonth()+1).padStart(2,'0');
+  const _dd   = String(_savedDate.getDate()).padStart(2,'0');
+  document.getElementById('eq-date').value = `${_yyyy}-${_mm}-${_dd}`;
+
+  // deslocamento
+  const t = q.travel||{};
+  document.getElementById('eq-dist').value        = t.distance||0;
+  document.getElementById('eq-round').value       = t.roundTrip||2;
+  document.getElementById('eq-vehicle').value     = t.vehicle||'carro_gas';
+  document.getElementById('eq-cons').value        = t.consumption||10;
+  document.getElementById('eq-fuel-price').value  = t.fuelPrice||6.20;
+  document.getElementById('eq-maint-rate').value  = t.maintenance||0.20;
+
+  const mode = t.enabled ? (t.mode||'visible') : 'none';
+  document.getElementById('eq-trav-mode').value = mode;
+
+  renderEditServices();
+  recalcEditTotal();
+
+  const modal = document.getElementById('edit-modal');
+  modal.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+}
+
+function closeEditModal() {
+  document.getElementById('edit-modal').style.display = 'none';
+  document.body.style.overflow = '';
+  _editingQuoteId = null;
+  _editServices   = [];
+}
+
+function applyEditVehiclePreset() {
+  const v = document.getElementById('eq-vehicle').value;
+  const [c,f,m] = VEHICLE_PRESETS[v]||[null,null,null];
+  if (c!=null) document.getElementById('eq-cons').value       = c;
+  if (f!=null) document.getElementById('eq-fuel-price').value = f;
+  if (m!=null) document.getElementById('eq-maint-rate').value = m;
+  recalcEditTotal();
+}
+
+function calcEditTravel() {
+  return calcTravelFromValues(
+    parseFloat(document.getElementById('eq-dist').value)||0,
+    parseInt(document.getElementById('eq-round').value)||1,
+    parseFloat(document.getElementById('eq-cons').value)||10,
+    parseFloat(document.getElementById('eq-fuel-price').value)||0,
+    parseFloat(document.getElementById('eq-maint-rate').value)||0
+  );
+}
+
+function recalcEditTotal() {
+  const mode = document.getElementById('eq-trav-mode').value;
+  const { travelCost, fuelCost, maintCost } = calcEditTravel();
+  const travAmt    = mode !== 'none' ? travelCost : 0;
+  const travPerSvc = (mode === 'diluted' && _editServices.length) ? travAmt / _editServices.length : 0;
+  const visibleTrav = mode === 'visible' ? travAmt : 0;
+
+  let svcTotal = 0;
+  _editServices.forEach(s => {
+    const base = Number(s.currentVal)||0;
+    const mat  = s.embedMaterial ? (Number(s.materialCost)||0) : 0;
+    svcTotal  += base + mat + travPerSvc;
+  });
+  const grand = svcTotal + visibleTrav;
+
+  document.getElementById('eq-svc-total').innerText  = fBRL5(svcTotal);
+  document.getElementById('eq-trav-val').innerText   = fBRL5(visibleTrav);
+  document.getElementById('eq-grand-total').innerText = fBRL5(grand);
+  document.getElementById('eq-trav-line').classList.toggle('d-none', mode !== 'visible');
+
+  const totalMins = _editServices.reduce((a,s)=>a+(s.duration||0),0);
+  const etEl = document.getElementById('eq-time-total');
+  if (etEl) {
+    if (!totalMins) { etEl.innerText = '—'; }
+    else { const h=Math.floor(totalMins/60),m=totalMins%60; etEl.innerText = h>0?(m>0?`${h}h ${m}min`:`${h}h`):`${m}min`; }
+  }
+
+  renderEditServices();
+}
+
+function renderEditServices() {
+  const mode = document.getElementById('eq-trav-mode').value;
+  const { travelCost } = calcEditTravel();
+  const travAmt    = mode !== 'none' ? travelCost : 0;
+  const travPerSvc = (mode === 'diluted' && _editServices.length) ? travAmt / _editServices.length : 0;
+
+  const list = document.getElementById('eq-services-list');
+  if (!_editServices.length) {
+    list.innerHTML = '<p class="text-xs text-slate-400 italic">nenhum serviço.</p>';
+    return;
+  }
+  list.innerHTML = _editServices.map((s,i) => {
+    const base  = Number(s.currentVal)||0;
+    const mat   = s.embedMaterial ? (Number(s.materialCost)||0) : 0;
+    const shown = roundUp5(base + mat + travPerSvc);
+    return `<div class="svc-item">
+      <div class="flex justify-between items-start mb-2">
+        <span class="text-xs font-bold text-slate-700 flex-1 pr-2">${escHtml(s.name)}</span>
+        <button onclick="removeEditService(${i})" class="text-red-400 hover:text-red-600 flex-shrink-0" title="remover">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mb-1">
+        <div>
+          <label class="label-xs">preço cobrado (R$)</label>
+          <input type="number" value="${base}" min="0" step="1" class="fi text-xs font-mono"
+            oninput="updateEditSvcPrice(${i},this.value)" />
+        </div>
+        <div>
+          <label class="label-xs">material (R$)</label>
+          <input type="number" value="${s.materialCost||0}" min="0" step="0.01" class="fi text-xs font-mono"
+            oninput="updateEditSvcMat(${i},this.value)" />
+        </div>
+        <div>
+          <label class="label-xs">⏱️ tempo (min)</label>
+          <input type="number" value="${s.duration||''}" min="0" step="5" placeholder="—" class="fi text-xs font-mono"
+            oninput="updateEditSvcDuration(${i},this.value)" />
+        </div>
+      </div>
+      <div class="flex justify-between items-center">
+        <label class="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer">
+          <input type="checkbox" ${s.embedMaterial?'checked':''} onchange="updateEditEmbedMat(${i},this.checked)" />
+          embutir material
+        </label>
+        <span class="text-xs font-mono font-bold text-blue-600">→ ${fBRL(shown)}</span>
+      </div>
+      ${s.notes?`<p class="text-xs text-slate-400 mt-1">📝 ${escHtml(s.notes)}</p>`:''}
+    </div>`;
+  }).join('');
+}
+
+function removeEditService(i) {
+  _editServices.splice(i,1);
+  recalcEditTotal();
+}
+
+function updateEditSvcPrice(i, val) {
+  if (_editServices[i]) { _editServices[i].currentVal = parseFloat(val)||0; recalcEditTotal(); }
+}
+function updateEditSvcMat(i, val) {
+  if (_editServices[i]) { _editServices[i].materialCost = parseFloat(val)||0; recalcEditTotal(); }
+}
+function updateEditSvcDuration(i, val) {
+  if (_editServices[i]) { _editServices[i].duration = parseInt(val)||0; recalcEditTotal(); }
+}
+function updateEditEmbedMat(i, checked) {
+  if (_editServices[i]) { _editServices[i].embedMaterial = checked; recalcEditTotal(); }
+}
+
+function saveEditedQuote() {
+  const q = state.quotes.find(q=>q.id===_editingQuoteId);
+  if (!q) return;
+
+  const mode = document.getElementById('eq-trav-mode').value;
+  const { travelCost, fuelCost, maintCost, totalKm } = calcEditTravel();
+  const travAmt    = mode !== 'none' ? travelCost : 0;
+  const travPerSvc = (mode === 'diluted' && _editServices.length) ? travAmt / _editServices.length : 0;
+  const visibleTrav = mode === 'visible' ? travAmt : 0;
+
+  let svcTotal = 0;
+  _editServices.forEach(s => {
+    const base = Number(s.currentVal)||0;
+    const mat  = s.embedMaterial ? (Number(s.materialCost)||0) : 0;
+    svcTotal  += base + mat + travPerSvc;
+  });
+  const grand = svcTotal + visibleTrav;
+
+  // atualiza o orçamento
+  q.clientName   = safeStr(document.getElementById('eq-client').value) || q.clientName;
+
+  // data personalizada
+  const newDateVal = document.getElementById('eq-date').value;
+  if (newDateVal) {
+    // mantém a hora original, troca só o dia/mês/ano
+    const orig = q.savedAt ? new Date(q.savedAt) : new Date();
+    const [ny, nm, nd] = newDateVal.split('-').map(Number);
+    orig.setFullYear(ny, nm-1, nd);
+    q.savedAt = orig.toISOString();
+  }
+
+  q.services     = JSON.parse(JSON.stringify(_editServices));
+  q.travelCost   = travAmt;
+  q.fuelCost     = mode !== 'none' ? fuelCost  : 0;
+  q.maintCost    = mode !== 'none' ? maintCost : 0;
+  q.totalServices = svcTotal;
+  q.grandTotal   = grand;
+  q.travel = {
+    ...q.travel,
+    enabled:     mode !== 'none',
+    mode:        mode === 'none' ? 'visible' : mode,
+    distance:    parseFloat(document.getElementById('eq-dist').value)||0,
+    roundTrip:   parseInt(document.getElementById('eq-round').value)||1,
+    vehicle:     document.getElementById('eq-vehicle').value,
+    consumption: parseFloat(document.getElementById('eq-cons').value)||10,
+    fuelPrice:   parseFloat(document.getElementById('eq-fuel-price').value)||0,
+    maintenance: parseFloat(document.getElementById('eq-maint-rate').value)||0,
+  };
+
+  // recalcula a proposta escrita
+  const savedState = JSON.parse(JSON.stringify(state));
+  state.services   = q.services;
+  state.clientName = q.clientName;
+  state.travel     = q.travel;
+  q.proposalText   = buildProposalText(new Date(q.savedAt).toLocaleDateString('pt-BR'));
+  Object.assign(state, savedState);
+
+  q.editedAt = new Date().toISOString();
+
+  saveAll();
+  renderHistory();
+  renderDashboard();
+  closeEditModal();
+  alert('✅ Orçamento atualizado!');
+}
+
+// busca de serviço dentro do modal de edição
+(function() {
+  let _editFound = [];
+  function initEditSearch() {
+    const inp = document.getElementById('eq-search');
+    const res = document.getElementById('eq-search-results');
+    if (!inp) return;
+    inp.addEventListener('input', e => {
+      const term = e.target.value.toLowerCase().trim();
+      if (term.length < 2) { res.classList.add('hidden'); return; }
+      _editFound = state.catalog.filter(s =>
+        s.name.toLowerCase().includes(term) || s.category.toLowerCase().includes(term)
+      ).slice(0,8);
+      if (!_editFound.length) { res.classList.add('hidden'); return; }
+      res.innerHTML = _editFound.map((s,i) => `
+        <div class="p-2.5 hover:bg-slate-50 cursor-pointer border-b border-slate-100 last:border-0 flex justify-between items-center"
+             data-ei="${i}">
+          <div>
+            <span class="block text-xs font-semibold text-slate-700">${escHtml(s.name)}</span>
+            <span class="text-xs text-slate-400">${s.category} · ${fBRL(s.min)}–${fBRL(s.max)}</span>
+          </div>
+          <span class="text-blue-500 font-bold text-lg">+</span>
+        </div>`).join('');
+      res.querySelectorAll('[data-ei]').forEach(el => {
+        el.addEventListener('click', () => {
+          const svc = _editFound[parseInt(el.dataset.ei)];
+          _editServices.push({...svc, id:makeId(), currentVal:svc.min, notes:'', materialCost:0, embedMaterial:false});
+          inp.value = '';
+          res.classList.add('hidden');
+          recalcEditTotal();
+        });
+      });
+      res.classList.remove('hidden');
+    });
+    document.addEventListener('click', e => {
+      if (!inp.contains(e.target) && !res.contains(e.target)) res.classList.add('hidden');
+    });
+  }
+  // inicializa quando o modal for aberto pela primeira vez
+  const origOpen = window.openEditModal;
+  window.openEditModal = function(id) {
+    origOpen(id);
+    setTimeout(initEditSearch, 0);
+  };
+})();
+
+/* ============================================================
+   INIT
+   ============================================================ */
+document.getElementById('current-date').innerText = new Date().toLocaleDateString('pt-BR',{
+  weekday:'long',year:'numeric',month:'long',day:'numeric'
+});
+
+document.getElementById('btn-copy-proposal').addEventListener('click', copyProposal);
+
+document.getElementById('client-name').addEventListener('input', e => {
+  state.clientName = e.target.value; updateTexts(); saveAll();
+});
+
+document.addEventListener('click', e => {
+  const nameInp = document.getElementById('client-name');
+  const acBox   = document.getElementById('client-autocomplete');
+  if (nameInp && acBox && !nameInp.contains(e.target) && !acBox.contains(e.target))
+    acBox.classList.add('hidden');
+});
+
+loadAll();
+applyStateToUI();
+renderDashboard();
+
+console.log('✅ Benedito Resolve — sistema carregado.');
+
+/* ── Scroll-safe card toggle ─────────────────────────────
+   Usa touchstart/touchend com threshold de 8px.
+   Se o dedo se moveu (scroll), ignora o toque.          */
+(function() {
+  let startY = 0, startX = 0, moved = false;
+
+  document.addEventListener('touchstart', function(e) {
+    startY = e.touches[0].clientY;
+    startX = e.touches[0].clientX;
+    moved = false;
+  }, { passive: true });
+
+  document.addEventListener('touchmove', function(e) {
+    if (Math.abs(e.touches[0].clientY - startY) > 8 ||
+        Math.abs(e.touches[0].clientX - startX) > 8) {
+      moved = true;
+    }
+  }, { passive: true });
+
+  document.addEventListener('touchend', function(e) {
+    if (moved) return;
+    const head = e.target.closest('[data-toggle]');
+    if (!head) return;
+    e.preventDefault();
+    const type = head.dataset.toggle;
+    const id   = head.dataset.id;
+    if (type === 'client') toggleClientCard(id);
+    if (type === 'quote')  toggleQuoteCard(id);
+  }, { passive: false });
+
+  // Fallback para mouse (desktop)
+  document.addEventListener('click', function(e) {
+    const head = e.target.closest('[data-toggle]');
+    if (!head) return;
+    const type = head.dataset.toggle;
+    const id   = head.dataset.id;
+    if (type === 'client') toggleClientCard(id);
+    if (type === 'quote')  toggleQuoteCard(id);
+  });
+})();
+</script>
+
+<script>
+  // Registro do Service Worker (PWA)
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./service-worker.js')
+        .then(reg => console.log('✅ Service Worker registrado:', reg.scope))
+        .catch(err => console.warn('⚠️ Service Worker falhou:', err));
+    });
+  }
+</script>
+</body>
+</html>
